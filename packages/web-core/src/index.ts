@@ -18,14 +18,14 @@ export const TemplatePreviewPage = lazy(() => import('./pages/template-preview')
 export const SkillResponseSharePage = lazy(() => import('./pages/skill-response-share'));
 export const DocumentSharePage = lazy(() => import('./pages/document-share'));
 export const DriveFileSharePage = lazy(() => import('./pages/drive-file-share'));
-export const ArtifactGalleryPage = lazy(() => import('./pages/artifact-gallery'));
-export const UseCasesGalleryPage = lazy(() => import('./pages/use-cases-gallery'));
 export const ProjectPage = lazy(() => import('./pages/project'));
 export const WorkflowListPage = lazy(() => import('./pages/workflow-list'));
 export const AppManager = lazy(() => import('./pages/app-manager'));
 export const MarketplacePage = lazy(() => import('./pages/marketplace'));
 export const WorkflowPage = lazy(() => import('./pages/workflow'));
 export const WorkspacePage = lazy(() => import('./pages/workspace'));
+export const RunHistoryPage = lazy(() => import('./pages/run-history'));
+export const RunDetailPage = lazy(() => import('./pages/run-detail'));
 
 export { AppLayout } from './components/layout';
 

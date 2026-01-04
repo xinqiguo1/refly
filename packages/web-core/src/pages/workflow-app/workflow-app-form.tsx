@@ -21,6 +21,42 @@ import getClient from '@refly-packages/ai-workspace-common/requests/proxiedReque
 import { useSubscriptionUsage } from '@refly-packages/ai-workspace-common/hooks/use-subscription-usage';
 import { useTemplateGenerationStatus } from '../../hooks/useTemplateGenerationStatus';
 import { TemplateEditorSkeleton } from './template-editor-skeleton';
+import {
+  useListUserTools,
+  useGetCanvasData,
+} from '@refly-packages/ai-workspace-common/queries/queries';
+import { extractToolsetsWithNodes, ToolWithNodes } from '@refly/canvas-common';
+import { GenericToolset, UserTool } from '@refly/openapi-schema';
+import { toolsetEmitter } from '@refly-packages/ai-workspace-common/events/toolset';
+import { storeSignupEntryPoint } from '@refly-packages/ai-workspace-common/hooks/use-pending-voucher-claim';
+
+/**
+ * Check if a toolset is authorized/installed
+ * - External OAuth tools: need authorization (check userTools.authorized)
+ * - Other tools (builtin, non-OAuth): always available, no installation needed
+ */
+const isToolsetAuthorized = (toolset: GenericToolset, userTools: UserTool[]): boolean => {
+  // MCP servers need to be checked separately
+  if (toolset.type === 'mcp') {
+    return userTools.some((t) => t.toolset?.name === toolset.name);
+  }
+
+  // Builtin tools are always available
+  if (toolset.builtin) {
+    return true;
+  }
+
+  // Find matching user tool by key
+  const matchingUserTool = userTools.find((t) => t.key === toolset.toolset?.key);
+
+  // If not in userTools list, user hasn't installed/authorized this tool
+  if (!matchingUserTool) {
+    return false;
+  }
+
+  // For external OAuth tools, check authorized status
+  return matchingUserTool.authorized ?? false;
+};
 
 const EmptyContent = () => {
   const { t } = useTranslation();
@@ -112,7 +148,59 @@ export const WorkflowAPPForm = ({
   }));
   const { creditBalance, isBalanceSuccess } = useSubscriptionUsage();
 
+  // Tool dependency checking
+  const { data: userToolsData, refetch: refetchUserTools } = useListUserTools({}, [], {
+    enabled: isLogin,
+    refetchOnWindowFocus: false,
+  });
+  const userTools = userToolsData?.data ?? [];
+
+  // Listen for toolset installation events and refetch user tools
+  useEffect(() => {
+    const handleToolsetInstalled = () => {
+      // Refetch user tools when a toolset is installed
+      refetchUserTools();
+    };
+
+    toolsetEmitter.on('toolsetInstalled', handleToolsetInstalled);
+
+    return () => {
+      toolsetEmitter.off('toolsetInstalled', handleToolsetInstalled);
+    };
+  }, [refetchUserTools]);
+
+  const { data: canvasResponse } = useGetCanvasData({ query: { canvasId: canvasId ?? '' } }, [], {
+    enabled: !!canvasId && isLogin,
+    refetchOnWindowFocus: false,
+  });
+
+  // Use workflowApp canvasData as primary source, fallback to API data
+  const canvasData = workflowApp?.canvasData ?? canvasResponse?.data;
+  const nodes = canvasData?.nodes || [];
+
+  // Check if there are uninstalled tools
+  const uninstalledCount = useMemo(() => {
+    if (!isLogin || !nodes.length) return 0;
+    const toolsetsWithNodes = extractToolsetsWithNodes(nodes);
+    return toolsetsWithNodes.filter((tool: ToolWithNodes) => {
+      return !isToolsetAuthorized(tool.toolset, userTools);
+    }).length;
+  }, [isLogin, userTools, nodes]);
+
   const [internalIsRunning, setInternalIsRunning] = useState(false);
+  const [toolsPanelOpen, setToolsPanelOpen] = useState(false);
+  const [highlightInstallButtons, setHighlightInstallButtons] = useState(false);
+  const [isFileUploading, setIsFileUploading] = useState(false);
+
+  const handleToolsDependencyOpenChange = useCallback(
+    (nextOpen: boolean) => {
+      setToolsPanelOpen(nextOpen);
+      if (!nextOpen) {
+        setHighlightInstallButtons(false);
+      }
+    },
+    [setToolsPanelOpen, setHighlightInstallButtons],
+  );
 
   // Use external isRunning if provided, otherwise use internal state
   const isRunning = externalIsRunning ?? internalIsRunning;
@@ -162,7 +250,8 @@ export const WorkflowAPPForm = ({
 
   // Show editor when template content is available and status is completed or idle
   const shouldShowEditor =
-    !!effectiveTemplateContent && (templateStatus === 'completed' || templateStatus === 'idle');
+    !!effectiveTemplateContent &&
+    (templateStatus === 'completed' || templateStatus === 'idle' || templateStatus === 'failed');
 
   // Show form when:
   // 1. Failed and no content (explicit failure)
@@ -350,6 +439,13 @@ export const WorkflowAPPForm = ({
   // Handle file upload for resource type variables
   const handleFileUpload = useCallback(
     async (file: File, variableName: string) => {
+      // Check if user is logged in
+      if (!isLogin) {
+        storeSignupEntryPoint('template_detail');
+        setLoginModalOpen(true);
+        return false;
+      }
+
       const currentFileList = variableValues[variableName] || [];
       const result = await uploadFile(file, currentFileList);
 
@@ -408,6 +504,13 @@ export const WorkflowAPPForm = ({
   // Handle file removal for resource type variables
   const handleFileRemove = useCallback(
     (file: UploadFile, variableName: string) => {
+      // Check if user is logged in
+      if (!isLogin) {
+        storeSignupEntryPoint('template_detail');
+        setLoginModalOpen(true);
+        return;
+      }
+
       const currentFileList = variableValues[variableName] || [];
       const newFileList = currentFileList.filter((f: UploadFile) => f.uid !== file.uid);
       handleValueChange(variableName, newFileList);
@@ -415,12 +518,19 @@ export const WorkflowAPPForm = ({
         [variableName]: newFileList,
       });
     },
-    [variableValues, handleValueChange],
+    [variableValues, handleValueChange, isLogin, setLoginModalOpen],
   );
 
   // Handle file refresh for resource type variables
   const handleRefreshFile = useCallback(
     (variableName: string) => {
+      // Check if user is logged in
+      if (!isLogin) {
+        storeSignupEntryPoint('template_detail');
+        setLoginModalOpen(true);
+        return;
+      }
+
       const currentFileList = variableValues[variableName] || [];
       // Find the variable to get its resourceTypes
       const variable = workflowVariables.find((v) => v.name === variableName);
@@ -442,7 +552,16 @@ export const WorkflowAPPForm = ({
         variableId,
       );
     },
-    [refreshFile, variableValues, handleValueChange, form, workflowVariables, canvasId],
+    [
+      refreshFile,
+      variableValues,
+      handleValueChange,
+      form,
+      workflowVariables,
+      canvasId,
+      isLogin,
+      setLoginModalOpen,
+    ],
   );
 
   // Initialize template variables when effectiveTemplateContent changes
@@ -466,7 +585,16 @@ export const WorkflowAPPForm = ({
 
     // Check if user is logged in
     if (!isLogin) {
+      storeSignupEntryPoint('template_detail');
       setLoginModalOpen(true);
+      return;
+    }
+
+    // Check if there are uninstalled tools
+    if (uninstalledCount > 0) {
+      message.warning(t('canvas.workflow.run.installToolsBeforeRunning'));
+      setToolsPanelOpen(true);
+      setHighlightInstallButtons(true);
       return;
     }
 
@@ -643,6 +771,7 @@ export const WorkflowAPPForm = ({
   const handleRemix = () => {
     // Check if user is logged in
     if (!isLogin) {
+      storeSignupEntryPoint('template_detail');
       setLoginModalOpen(true);
       return;
     }
@@ -667,7 +796,12 @@ export const WorkflowAPPForm = ({
           name={name}
           rules={
             required
-              ? [{ required: true, message: t('canvas.workflow.variables.inputPlaceholder') }]
+              ? [
+                  {
+                    required: true,
+                    message: t('canvas.workflow.variables.inputPlaceholder'),
+                  },
+                ]
               : []
           }
           data-field-name={name}
@@ -692,7 +826,12 @@ export const WorkflowAPPForm = ({
           name={name}
           rules={
             required
-              ? [{ required: true, message: t('canvas.workflow.variables.selectPlaceholder') }]
+              ? [
+                  {
+                    required: true,
+                    message: t('canvas.workflow.variables.selectPlaceholder'),
+                  },
+                ]
               : []
           }
         >
@@ -718,7 +857,12 @@ export const WorkflowAPPForm = ({
           name={name}
           rules={
             required
-              ? [{ required: true, message: t('canvas.workflow.variables.uploadPlaceholder') }]
+              ? [
+                  {
+                    required: true,
+                    message: t('canvas.workflow.variables.uploadPlaceholder'),
+                  },
+                ]
               : []
           }
         >
@@ -744,7 +888,25 @@ export const WorkflowAPPForm = ({
     setTemplateVariables(variables);
   }, []);
 
-  const isRunButtonDisabled = loading || isRunning;
+  // Handle file uploading state changes from MixedTextEditor
+  const handleFileUploadingChange = useCallback((uploading: boolean) => {
+    setIsFileUploading(uploading);
+  }, []);
+
+  // Handle before file upload check
+  const handleBeforeFileUpload = useCallback(() => {
+    // Check if user is logged in
+    if (!isLogin) {
+      storeSignupEntryPoint('template_detail');
+      setLoginModalOpen(true);
+      return false;
+    }
+    return true;
+  }, [isLogin, setLoginModalOpen]);
+
+  // Separate executing state (for loading indicator) from disabled state
+  const isExecuting = loading || isRunning;
+  const isRunButtonDisabled = isExecuting || isFileUploading;
 
   return (
     <div>
@@ -760,7 +922,12 @@ export const WorkflowAPPForm = ({
                 {/* Tools Dependency Form */}
                 {workflowApp?.canvasData && (
                   <div className="mt-3 flex items-center justify-between">
-                    <ToolsDependencyChecker canvasData={workflowApp?.canvasData} />
+                    <ToolsDependencyChecker
+                      canvasData={workflowApp?.canvasData}
+                      externalOpen={toolsPanelOpen}
+                      highlightInstallButtons={highlightInstallButtons}
+                      onOpenChange={handleToolsDependencyOpenChange}
+                    />
 
                     <Tooltip title={t('canvas.workflow.run.toolsGuide') || 'Tools Guide'}>
                       <Button
@@ -857,10 +1024,10 @@ export const WorkflowAPPForm = ({
                       'h-10 flex items-center justify-center',
                       'w-[120px] sm:w-[200px] min-w-[109px]',
                       'px-4 sm:px-[46px] gap-2',
-                      'text-white dark:text-[var(--text-icon-refly-text-flip,#1C1F23)] dark:hover:text-[var(--text-icon-refly-text-flip,#1C1F23)] font-roboto font-semibold text-[16px] leading-[1.25em]',
+                      'text-white dark:text-[var(--text-icon-refly-text-flip,#1C1F23)] font-roboto font-semibold text-[16px] leading-[1.25em]',
                       'border-none shadow-none rounded-[12px]',
                       'transition-colors duration-150 ease-in-out',
-                      'bg-refly-bg-control-z1 hover:!bg-refly-tertiary-hover dark:bg-[var(--bg---refly-bg-dark,#ECECEC)] dark:hover:!bg-[var(--bg---refly-bg-dark,#ECECEC)]',
+                      'bg-refly-bg-control-z1 dark:bg-[var(--bg---refly-bg-dark,#ECECEC)] ',
                     )}
                     type="primary"
                     disabled
@@ -893,11 +1060,18 @@ export const WorkflowAPPForm = ({
                   onVariablesChange={handleTemplateVariableChange}
                   disabled={isFormDisabled}
                   originalVariables={workflowVariables}
+                  onUploadingChange={handleFileUploadingChange}
+                  onBeforeUpload={handleBeforeFileUpload}
                 />
                 {/* Tools Dependency Form */}
                 {workflowApp?.canvasData && (
                   <div className="mt-3 flex items-center justify-between">
-                    <ToolsDependencyChecker canvasData={workflowApp?.canvasData} />
+                    <ToolsDependencyChecker
+                      canvasData={workflowApp?.canvasData}
+                      externalOpen={toolsPanelOpen}
+                      highlightInstallButtons={highlightInstallButtons}
+                      onOpenChange={handleToolsDependencyOpenChange}
+                    />
 
                     <Tooltip title={t('canvas.workflow.run.toolsGuide') || 'Tools Guide'}>
                       <Button
@@ -1003,14 +1177,14 @@ export const WorkflowAPPForm = ({
                     )}
                     type="primary"
                     onClick={handleRun}
-                    loading={isRunButtonDisabled}
+                    loading={isExecuting}
                     disabled={isRunButtonDisabled}
                   >
                     <span className="inline-flex items-center gap-[2px]">
-                      {isRunButtonDisabled
+                      {isExecuting
                         ? t('canvas.workflow.run.executing')
                         : t('canvas.workflow.run.run')}
-                      {!isRunButtonDisabled && (
+                      {!isExecuting && (
                         <svg
                           xmlns="http://www.w3.org/2000/svg"
                           width="18"
@@ -1074,7 +1248,12 @@ export const WorkflowAPPForm = ({
                     {/* Tools Dependency Form */}
                     {workflowApp?.canvasData && (
                       <div className="mt-5 ">
-                        <ToolsDependencyChecker canvasData={workflowApp?.canvasData} />
+                        <ToolsDependencyChecker
+                          canvasData={workflowApp?.canvasData}
+                          externalOpen={toolsPanelOpen}
+                          highlightInstallButtons={highlightInstallButtons}
+                          onOpenChange={handleToolsDependencyOpenChange}
+                        />
                       </div>
                     )}
                   </>
@@ -1149,14 +1328,14 @@ export const WorkflowAPPForm = ({
                     )}
                     type="primary"
                     onClick={handleRun}
-                    loading={isRunButtonDisabled}
+                    loading={isExecuting}
                     disabled={isRunButtonDisabled || !isFormValid}
                   >
                     <span className="inline-flex items-center gap-[2px]">
-                      {isRunButtonDisabled
+                      {isExecuting
                         ? t('canvas.workflow.run.executing')
                         : t('canvas.workflow.run.run')}
-                      {!isRunButtonDisabled && (
+                      {!isExecuting && (
                         <svg
                           xmlns="http://www.w3.org/2000/svg"
                           width="18"

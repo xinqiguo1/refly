@@ -97,7 +97,7 @@ export class VoucherService implements OnModuleInit {
           pattern: '30 */2 * * *', // Run every 2 hours at minute 30
         },
         removeOnComplete: true,
-        removeOnFail: false,
+        removeOnFail: true,
         jobId: 'cleanup-expired-vouchers', // Unique job ID to prevent duplicates
         attempts: 3,
         backoff: {
@@ -370,6 +370,9 @@ export class VoucherService implements OnModuleInit {
           const promoCode = await this.stripeClient.promotionCodes.create({
             coupon: stripeCoupon.stripeCouponId,
             max_redemptions: 1, // One-time use
+            restrictions: {
+              first_time_transaction: true, // Only for users who haven't made a purchase
+            },
             expires_at: Math.floor(input.expiresAt.getTime() / 1000), // Convert to Unix timestamp
             metadata: {
               voucherId,
@@ -633,14 +636,29 @@ export class VoucherService implements OnModuleInit {
 
   /**
    * Create a sharing invitation for a voucher
+   * Users can share if they are the owner OR if they claimed the voucher via invitation
    */
   async createInvitation(uid: string, voucherId: string): Promise<CreateInvitationResult> {
-    // Get the voucher
+    // Get the voucher (without uid filter - we'll check permission separately)
     const voucher = await this.prisma.voucher.findFirst({
-      where: { voucherId, uid },
+      where: { voucherId },
     });
 
     if (!voucher) {
+      throw new Error('Voucher not found');
+    }
+
+    // Check permission: owner OR claimant (same logic as validateVoucher)
+    const isOwner = voucher.uid === uid;
+    const isClaimant = await this.prisma.voucherInvitation.findFirst({
+      where: {
+        voucherId,
+        inviteeUid: uid,
+        status: InvitationStatus.CLAIMED,
+      },
+    });
+
+    if (!isOwner && !isClaimant) {
       throw new Error('Voucher not found');
     }
 

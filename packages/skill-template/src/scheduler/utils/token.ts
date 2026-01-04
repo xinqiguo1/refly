@@ -1,7 +1,9 @@
-import { encode } from 'gpt-tokenizer';
 import { BaseMessage, MessageContent } from '@langchain/core/messages';
 import { SkillContext } from '@refly/openapi-schema';
-import { truncateContent as baseTruncateContent } from '@refly/utils';
+import {
+  truncateContent as baseTruncateContent,
+  countToken as baseCountToken,
+} from '@refly/utils/token';
 
 // ============================================================================
 // Token Estimation (Fast, ~1000x faster than exact counting)
@@ -73,12 +75,19 @@ export const truncateContentFast = (content: string, targetTokens: number): stri
 
 /**
  * Count tokens in MessageContent (supports both string and array formats)
+ * Uses tiktoken via @refly/utils for accurate counting
  */
-export const countToken = (content: MessageContent) => {
-  const inputText = Array.isArray(content)
+export const countToken = (content: MessageContent, toolCalls?: any[]) => {
+  let inputText = Array.isArray(content)
     ? content.map((msg) => (msg.type === 'text' ? msg.text : '')).join('')
     : String(content || '');
-  return encode(inputText).length;
+
+  // Add tool calls to input text for token counting
+  if (toolCalls && toolCalls.length > 0) {
+    inputText += JSON.stringify(toolCalls);
+  }
+
+  return baseCountToken(inputText);
 };
 
 export const checkHasContext = (context: SkillContext) => {
@@ -86,7 +95,10 @@ export const checkHasContext = (context: SkillContext) => {
 };
 
 export const countMessagesTokens = (messages: BaseMessage[] = []) => {
-  return messages.reduce((sum, message) => sum + countToken(message.content), 0);
+  return messages.reduce(
+    (sum, message) => sum + countToken(message.content, (message as any).tool_calls),
+    0,
+  );
 };
 
 /**

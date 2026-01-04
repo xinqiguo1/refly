@@ -1,12 +1,12 @@
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import type { DriveFile } from '@refly/openapi-schema';
+import type { DriveFile, WorkflowPlan } from '@refly/openapi-schema';
 
 import { MarkdownMode } from '../../types';
 import { ToolCallStatus, parseToolCallStatus } from './types';
 import { CopilotWorkflowPlan } from './copilot-workflow-plan';
-import { WorkflowPlan } from '@refly/canvas-common';
 import { safeParseJSON } from '@refly/utils/parse';
+import { InternalToolRenderer } from './internal-tool-renderers';
 import { ProductCard } from './product-card';
 import { ToolsetIcon } from '@refly-packages/ai-workspace-common/components/canvas/common/toolset-icon';
 import { Button, Typography } from 'antd';
@@ -18,6 +18,7 @@ import {
   useGetToolCallResult,
 } from '@refly-packages/ai-workspace-common/queries';
 import cn from 'classnames';
+import { CopilotSummaryRenderer } from './internal-tool-renderers/copilot-summary-renderer';
 
 const { Paragraph } = Typography;
 
@@ -174,6 +175,20 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
   // Check if result exists
   const hasResult = !!resultContent;
 
+  // Parse result content as object for internal tool renderers
+  const resultContentParsed = useMemo(() => {
+    if (!resultContent || typeof resultContent !== 'string') {
+      return {};
+    }
+    try {
+      const parsed = JSON.parse(resultContent);
+      // Handle nested data structure (e.g., { data: { fileName: '...' } })
+      return parsed?.data ?? parsed ?? {};
+    } catch {
+      return {};
+    }
+  }, [resultContent]);
+
   // Compute execution duration when timestamps are provided
   const durationText = useMemo(() => {
     let createdAt: number;
@@ -217,26 +232,42 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
     fetchedData?.data?.result?.updatedAt,
   ]);
 
-  const isCopilotGenerateWorkflow = toolsetKey === 'copilot' && toolName === 'generate_workflow';
-  if (isCopilotGenerateWorkflow) {
-    const resultStr = props['data-tool-result'] ?? '{}';
-    const structuredArgs = safeParseJSON(resultStr)?.data as WorkflowPlan;
+  if (toolsetKey === 'copilot') {
+    if (toolName === 'generate_workflow' || toolName === 'patch_workflow') {
+      const resultStr = props['data-tool-result'] ?? '{}';
+      const structuredArgs = safeParseJSON(resultStr)?.data as WorkflowPlan;
 
-    // Handle case when structuredArgs is undefined
-    if (!structuredArgs) {
-      return (
-        <div className="border-t border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 py-2">
-          <div className="rounded-md bg-gray-100 dark:bg-gray-700 px-4 py-3 text-xs font-normal whitespace-pre-wrap text-gray-800 dark:text-gray-200 leading-[22px]">
-            {toolCallStatus === ToolCallStatus.EXECUTING
-              ? t('components.markdown.workflow.generating')
-              : t('components.markdown.workflow.invalidData')}
+      // Handle case when structuredArgs is undefined
+      if (!structuredArgs) {
+        return (
+          <div className="border-t border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 py-2">
+            <div className="rounded-md bg-gray-100 dark:bg-gray-700 px-4 py-3 text-xs font-normal whitespace-pre-wrap text-gray-800 dark:text-gray-200 leading-[22px]">
+              {toolCallStatus === ToolCallStatus.EXECUTING
+                ? t('components.markdown.workflow.generating')
+                : t('components.markdown.workflow.invalidData')}
+            </div>
           </div>
-        </div>
-      );
+        );
+      }
+
+      return <CopilotWorkflowPlan data={structuredArgs} />;
     }
 
-    return <CopilotWorkflowPlan data={structuredArgs} />;
+    if (toolName === 'get_workflow_summary') {
+      return (
+        <CopilotSummaryRenderer
+          toolsetKey="copilot"
+          toolCallStatus={toolCallStatus}
+          durationText={durationText}
+          parametersContent={parametersContent}
+        />
+      );
+    }
   }
+
+  const isDriveFileId = (value: unknown): value is string => {
+    return typeof value === 'string' && value.startsWith('df-');
+  };
 
   const filePreviewDriveFile = useMemo<DriveFile[]>(() => {
     const result = safeParseJSON(resultContent);
@@ -244,18 +275,20 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
     const files = result?.files ?? resultData?.files;
 
     if (Array.isArray(files) && files.length > 0) {
-      return files.map((file) => ({
-        fileId: String(file.fileId),
-        canvasId: String(file.canvasId ?? ''),
-        name: String(file.name ?? file.fileName ?? 'Drive file'),
-        type: String(file.type ?? file.mimeType ?? 'application/octet-stream'),
-      }));
+      return files
+        .filter((file) => isDriveFileId(file?.fileId))
+        .map((file) => ({
+          fileId: file.fileId,
+          canvasId: String(file.canvasId ?? ''),
+          name: String(file.name ?? file.fileName ?? 'Drive file'),
+          type: String(file.type ?? file.mimeType ?? 'application/octet-stream'),
+        }));
     }
 
-    if (resultData?.fileId) {
+    if (isDriveFileId(resultData?.fileId)) {
       return [
         {
-          fileId: String(resultData.fileId),
+          fileId: resultData.fileId,
           canvasId: String(resultData.canvasId ?? ''),
           name: String(resultData.name ?? resultData.fileName ?? 'Drive file'),
           type: String(resultData.type ?? resultData.mimeType ?? 'application/octet-stream'),
@@ -275,6 +308,21 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
   });
   const toolsetDefinition = data?.data?.find((t) => t.key === toolsetKey);
   const toolsetName = toolsetDefinition?.labelDict?.[currentLanguage] ?? toolsetKey;
+
+  // Compact rendering for internal/system-level tools (read_file, list_files)
+  const isInternalTool = toolsetDefinition?.internal === true;
+  if (isInternalTool) {
+    return (
+      <InternalToolRenderer
+        toolsetKey={toolsetKey}
+        toolsetName={toolsetName}
+        toolCallStatus={toolCallStatus}
+        durationText={durationText}
+        parametersContent={parametersContent as Record<string, unknown>}
+        resultContent={resultContentParsed}
+      />
+    );
+  }
 
   return (
     <>

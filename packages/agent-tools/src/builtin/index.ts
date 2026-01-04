@@ -35,6 +35,14 @@ export const BuiltinToolsetDefinition: ToolsetDefinition = {
       modelOnly: true,
     },
     {
+      name: 'list_files',
+      descriptionDict: {
+        en: 'List all files in the current canvas.',
+        'zh-CN': '列出当前画布中的所有文件。',
+      },
+      modelOnly: true,
+    },
+    {
       name: 'generate_doc',
       descriptionDict: {
         en: 'Generate a new document based on a title and content.',
@@ -139,7 +147,7 @@ export const BuiltinSendEmailDefinition: ToolsetDefinition = {
 
 export const BuiltinGetTimeDefinition: ToolsetDefinition = {
   key: 'get_time',
-  internal: true,
+  // internal: true - This tool should be visible in mentionList for user selection
   labelDict: {
     en: 'Get Time',
     'zh-CN': '获取时间',
@@ -152,6 +160,7 @@ export const BuiltinGetTimeDefinition: ToolsetDefinition = {
 
 export const BuiltinReadFileDefinition: ToolsetDefinition = {
   key: 'read_file',
+  //  System-level tool, auto-included, hidden from mentionList, uses compact rendering
   internal: true,
   labelDict: {
     en: 'Read File',
@@ -165,7 +174,7 @@ export const BuiltinReadFileDefinition: ToolsetDefinition = {
 
 export const BuiltinExecuteCodeDefinition: ToolsetDefinition = {
   key: 'execute_code',
-  internal: true,
+  // internal: true - This tool should be visible in mentionList for user selection
   labelDict: {
     en: 'Execute Code',
     'zh-CN': '执行代码',
@@ -173,6 +182,44 @@ export const BuiltinExecuteCodeDefinition: ToolsetDefinition = {
   descriptionDict: {
     en: 'Execute code in a secure sandbox environment.',
     'zh-CN': '在安全的沙箱环境中执行代码。',
+  },
+};
+
+export const BuiltinListFilesDefinition: ToolsetDefinition = {
+  key: 'list_files',
+  // System-level tool, auto-included, hidden from mentionList, uses compact rendering
+  internal: true,
+  labelDict: {
+    en: 'List Files',
+    'zh-CN': '列出文件',
+  },
+  descriptionDict: {
+    en: 'List all files in the current canvas.',
+    'zh-CN': '列出当前画布中的所有文件。',
+  },
+};
+
+export const BuiltinGenerateWorkflowPlanDefinition: ToolsetDefinition = {
+  key: 'generate_workflow_plan',
+  labelDict: {
+    en: 'Generate Workflow Plan',
+    'zh-CN': '生成工作流计划',
+  },
+  descriptionDict: {
+    en: 'Generate a new workflow plan based on tasks and variables.',
+    'zh-CN': '根据任务和变量生成新的工作流计划。',
+  },
+};
+
+export const BuiltinPatchWorkflowPlanDefinition: ToolsetDefinition = {
+  key: 'patch_workflow_plan',
+  labelDict: {
+    en: 'Patch Workflow Plan',
+    'zh-CN': '修补工作流计划',
+  },
+  descriptionDict: {
+    en: 'Patch an existing workflow plan with changes.',
+    'zh-CN': '通过更改修补现有工作流计划。',
   },
 };
 
@@ -291,22 +338,13 @@ export class BuiltinGenerateDoc extends AgentBaseTool<BuiltinToolParams> {
   schema = z.object({
     title: z.string().describe('Title of the document to generate'),
     content: z.string().describe(
-      `Document content. When referencing files from context, replace the filename with its fileId using these formats:
+      `Document content. When embedding files from context, use these placeholder formats:
+- \`file-content://df-<fileId>\` - Direct content URL (for <img src="">, embedded media)
+- \`file://df-<fileId>\` - Share page URL (for <a href="">, clickable links)
 
-Supported fileId placeholder formats:
-- \`file-content://df-<fileId>\` - Direct content URL (for embedded media)
-- \`file://df-<fileId>\` - Share page URL (for clickable links)
-- \`fileId://df-<fileId>\` - Share page URL
-- \`@file:df-<fileId>\` - Share page URL
-- \`files/df-<fileId>\` - Share page URL
-- \`df-<fileId>\` - Direct content URL (standalone)
+Example: ![image](file-content://df-xxx) or <img src="file-content://df-xxx">
 
-Usage by document type:
-- Markdown: \`![alt text](df-<fileId>)\` or \`![alt text](file-content://df-<fileId>)\`
-- HTML: \`<img src="file-content://df-<fileId>">\` or \`<a href="file://df-<fileId>">\`
-- Plain text/other: Use direct fileId \`df-<fileId>\` which converts to content URL
-
-IMPORTANT: Always use the fileId (format: df-xxx) from context, NOT the original filename.`,
+IMPORTANT: Use the fileId (format: df-xxx) from context, NOT the original filename.`,
     ),
   });
   description =
@@ -358,32 +396,45 @@ IMPORTANT: Always use the fileId (format: df-xxx) from context, NOT the original
 
   /**
    * Replace file placeholders in content with HTTP URLs.
-   * Supports multiple formats:
-   * - `file-content://df-xxx` → Direct file content URL (for images, etc.)
-   * - `file://df-xxx` → Share page URL (for links/previews)
-   * - `fileId://df-xxx` → Share page URL
-   * - `@file:df-xxx` → Share page URL
-   * - `files/df-xxx` → Share page URL
-   * - `df-xxx` (standalone) → Direct file content URL
+   * Supported formats:
+   * - `file-content://df-xxx` → Direct file content URL (for images, embedded media)
+   * - `file://df-xxx` → Share page URL (for links)
    */
   private async replaceFilePlaceholders(content: string): Promise<string> {
     if (!content) {
       return content;
     }
 
-    try {
-      // Pattern to find all fileIds in various formats
-      // Uses lookbehind to ensure 'df-' is not preceded by alphanumeric (avoid matching 'pdf-xxx')
-      const fileIdPattern = /(?<![a-z0-9])(df-[a-z0-9]+)\b/gi;
-      const allMatches = Array.from(content.matchAll(fileIdPattern));
+    // Check for placeholder formats
+    const hasFileContent = content.includes('file-content://df-');
+    const hasFile = content.includes('file://df-');
 
-      if (allMatches.length === 0) {
+    if (!hasFileContent && !hasFile) {
+      return content;
+    }
+
+    try {
+      // Match both formats
+      const contentMatchPattern = /file-content:\/\/(df-[a-z0-9]+)/gi;
+      const shareMatchPattern = /file:\/\/(df-[a-z0-9]+)/gi;
+
+      const contentMatches = Array.from(content.matchAll(contentMatchPattern));
+      const shareMatches = Array.from(content.matchAll(shareMatchPattern));
+
+      // Collect all unique file IDs
+      const allFileIds = new Set<string>();
+      for (const [, fileId] of contentMatches) {
+        allFileIds.add(fileId);
+      }
+      for (const [, fileId] of shareMatches) {
+        allFileIds.add(fileId);
+      }
+
+      if (allFileIds.size === 0) {
         return content;
       }
 
-      // Collect unique file IDs
-      const uniqueFileIds = [...new Set(allMatches.map(([, fileId]) => fileId))];
-
+      const uniqueFileIds = Array.from(allFileIds);
       const { reflyService, user } = this.params;
 
       // Fetch all drive files and generate URLs
@@ -393,7 +444,6 @@ IMPORTANT: Always use the fileId (format: df-xxx) from context, NOT the original
             const { url, contentUrl } = await reflyService.createShareForDriveFile(user, fileId);
             return { fileId, shareUrl: url, contentUrl };
           } catch (error) {
-            // If file not found or URL generation fails, log and keep original placeholder
             console.error(
               `[BuiltinGenerateDoc] Failed to create share URL for fileId ${fileId}:`,
               error,
@@ -426,38 +476,12 @@ IMPORTANT: Always use the fileId (format: df-xxx) from context, NOT the original
 
       // Replace file://df-xxx with share page URLs (but not file-content://)
       result = result.replace(
-        /(?<!-)file:\/\/(df-[a-z0-9]+)/gi,
+        /file:\/\/(df-[a-z0-9]+)/gi,
         (match, fileId: string) => shareUrlMap.get(fileId) ?? match,
       );
-
-      // Replace fileId://df-xxx with share page URLs
-      result = result.replace(
-        /fileId:\/\/(df-[a-z0-9]+)/gi,
-        (match, fileId: string) => shareUrlMap.get(fileId) ?? match,
-      );
-
-      // Replace @file:df-xxx with share page URLs
-      result = result.replace(
-        /@file:(df-[a-z0-9]+)/gi,
-        (match, fileId: string) => shareUrlMap.get(fileId) ?? match,
-      );
-
-      // Replace files/df-xxx with share page URLs
-      result = result.replace(
-        /files\/(df-[a-z0-9]+)/gi,
-        (match, fileId: string) => shareUrlMap.get(fileId) ?? match,
-      );
-
-      // Replace standalone df-xxx (not already processed) with content URLs
-      // This handles cases like markdown images: ![image](df-xxx)
-      result = result.replace(/(?<![a-z0-9:/])(df-[a-z0-9]+)\b/gi, (match, fileId: string) => {
-        // Only replace if we have a URL for this fileId
-        return contentUrlMap.get(fileId) ?? match;
-      });
 
       return result;
     } catch (error) {
-      // Log error and return original content to avoid breaking document generation
       console.error('[BuiltinGenerateDoc] Error replacing file placeholders:', error);
       return content;
     }
@@ -472,7 +496,15 @@ export class BuiltinGenerateCodeArtifact extends AgentBaseTool<BuiltinToolParams
     filename: z
       .string()
       .describe('Name of the file to generate, must include extension (.md, .html, .svg, etc.)'),
-    content: z.string().describe('File content (markdown, HTML, SVG markup, etc.)'),
+    content: z.string().describe(
+      `File content (markdown, HTML, SVG markup, etc.). When embedding files from context, use these placeholder formats:
+- \`file-content://df-<fileId>\` - Direct content URL (for <img src="">, <image href="">, embedded media)
+- \`file://df-<fileId>\` - Share page URL (for <a href="">, clickable links)
+
+Example: ![image](file-content://df-xxx) or <img src="file-content://df-xxx">
+
+IMPORTANT: Use the fileId (format: df-xxx) from context, NOT the original filename.`,
+    ),
   });
 
   description = `Generate renderable content files that display as rich previews in the UI.
@@ -491,10 +523,8 @@ export class BuiltinGenerateCodeArtifact extends AgentBaseTool<BuiltinToolParams
 - ❌ Executable code files (.py, .js, .ts) — use execute_code tool instead
 - ❌ Data files (CSV, JSON, Excel) — use execute_code to generate these
 
-## Important
-- Always use **full URLs** for embedded images/links (e.g., http://localhost:5173/v1/drive/file/content/df-xxx)
-- SVG \`<image>\` tag requires **explicit numeric width and height** (e.g., \`width="300" height="200"\`). Do NOT use \`auto\` — it's invalid in SVG
-- Markdown supports standard image syntax: ![alt](full-url)`;
+## Note
+- SVG \`<image>\` tag requires explicit numeric width and height (e.g., \`width="300" height="200"\`)`;
 
   protected params: BuiltinToolParams;
 
@@ -510,10 +540,14 @@ export class BuiltinGenerateCodeArtifact extends AgentBaseTool<BuiltinToolParams
   ): Promise<ToolCallResult> {
     try {
       const { reflyService, user } = this.params;
+
+      // Replace file placeholders with HTTP URLs before writing
+      const processedContent = await this.replaceFilePlaceholders(input.content);
+
       const file = await reflyService.writeFile(user, {
         name: input.filename,
         type: 'text/plain',
-        content: input.content,
+        content: processedContent,
         canvasId: config.configurable?.canvasId,
         resultId: config.configurable?.resultId,
         resultVersion: config.configurable?.version,
@@ -533,6 +567,99 @@ export class BuiltinGenerateCodeArtifact extends AgentBaseTool<BuiltinToolParams
             ? error.message
             : 'Unknown error occurred while generating code artifact',
       };
+    }
+  }
+
+  /**
+   * Replace file placeholders in content with HTTP URLs.
+   * Supported formats:
+   * - `file-content://df-xxx` → Direct file content URL (for images, embedded media)
+   * - `file://df-xxx` → Share page URL (for links)
+   */
+  private async replaceFilePlaceholders(content: string): Promise<string> {
+    if (!content) {
+      return content;
+    }
+
+    // Check for placeholder formats
+    const hasFileContent = content.includes('file-content://df-');
+    const hasFile = content.includes('file://df-');
+
+    if (!hasFileContent && !hasFile) {
+      return content;
+    }
+
+    try {
+      // Match both formats
+      const contentMatchPattern = /file-content:\/\/(df-[a-z0-9]+)/gi;
+      const shareMatchPattern = /file:\/\/(df-[a-z0-9]+)/gi;
+
+      const contentMatches = Array.from(content.matchAll(contentMatchPattern));
+      const shareMatches = Array.from(content.matchAll(shareMatchPattern));
+
+      // Collect all unique file IDs
+      const allFileIds = new Set<string>();
+      for (const [, fileId] of contentMatches) {
+        allFileIds.add(fileId);
+      }
+      for (const [, fileId] of shareMatches) {
+        allFileIds.add(fileId);
+      }
+
+      if (allFileIds.size === 0) {
+        return content;
+      }
+
+      const uniqueFileIds = Array.from(allFileIds);
+      const { reflyService, user } = this.params;
+
+      // Fetch all drive files and generate URLs
+      const urlResults = await Promise.all(
+        uniqueFileIds.map(async (fileId) => {
+          try {
+            const { url, contentUrl } = await reflyService.createShareForDriveFile(user, fileId);
+            return { fileId, shareUrl: url, contentUrl };
+          } catch (error) {
+            console.error(
+              `[BuiltinGenerateCodeArtifact] Failed to create share URL for fileId ${fileId}:`,
+              error,
+            );
+            return { fileId, shareUrl: null, contentUrl: null };
+          }
+        }),
+      );
+
+      // Build URL maps
+      const shareUrlMap = new Map<string, string>();
+      const contentUrlMap = new Map<string, string>();
+
+      for (const { fileId, shareUrl, contentUrl } of urlResults) {
+        if (shareUrl) {
+          shareUrlMap.set(fileId, shareUrl);
+        }
+        if (contentUrl) {
+          contentUrlMap.set(fileId, contentUrl);
+        }
+      }
+
+      let result = content;
+
+      // Replace file-content://df-xxx with direct content URLs
+      result = result.replace(
+        /file-content:\/\/(df-[a-z0-9]+)/gi,
+        (match, fileId: string) => contentUrlMap.get(fileId) ?? match,
+      );
+
+      // Replace file://df-xxx with share page URLs (but not file-content://)
+      result = result.replace(
+        /file:\/\/(df-[a-z0-9]+)/gi,
+        (match, fileId: string) => shareUrlMap.get(fileId) ?? match,
+      );
+
+      return result;
+    } catch (error) {
+      console.error('[BuiltinGenerateCodeArtifact] Error replacing file placeholders:', error);
+      return content;
     }
   }
 }
@@ -623,7 +750,7 @@ IMPORTANT: Use \`file-content://\` for <img>, <video>, <audio> src attributes. U
 
     // Match both formats: file-content://df-xxx and file://df-xxx
     const contentMatchPattern = /file-content:\/\/(df-[a-zA-Z0-9]+)/g;
-    const shareMatchPattern = /(?<!file-content:\/\/)file:\/\/(df-[a-zA-Z0-9]+)/g;
+    const shareMatchPattern = /file:\/\/(df-[a-zA-Z0-9]+)/g;
 
     const contentMatches = Array.from(html.matchAll(contentMatchPattern));
     const shareMatches = Array.from(html.matchAll(shareMatchPattern));
@@ -645,35 +772,31 @@ IMPORTANT: Use \`file-content://\` for <img>, <video>, <audio> src attributes. U
 
     const uniqueFileIds = Array.from(allFileIds);
 
-    // Fetch all drive files
-    const driveFiles = await Promise.all(
-      uniqueFileIds.map(async (fileId) => {
-        const file = await reflyService.readFile(user, fileId);
-        if (!file) {
-          throw new Error(`Drive file not found: ${fileId}`);
-        }
-        return file;
-      }),
-    );
-
     // Get both URL types for each file
     const urlResults = await Promise.all(
-      driveFiles.map(async (file) => {
-        const { url, contentUrl } = await reflyService.createShareForDriveFile(user, file.fileId);
-        return { fileId: file.fileId, shareUrl: url, contentUrl };
+      uniqueFileIds.map(async (fileId) => {
+        try {
+          const { url, contentUrl } = await reflyService.createShareForDriveFile(user, fileId);
+          return { fileId, shareUrl: url, contentUrl };
+        } catch (error) {
+          console.error(
+            `[BuiltinShareFiles] Failed to create share URL for fileId ${fileId}:`,
+            error,
+          );
+          return { fileId, shareUrl: null, contentUrl: null };
+        }
       }),
     );
 
-    // Build maps for both URL types
+    // Build maps for both URL types (only include successful results)
     const shareUrlMap = new Map<string, string>();
     const contentUrlMap = new Map<string, string>();
 
     for (const { fileId, shareUrl, contentUrl } of urlResults) {
-      if (!shareUrl || !contentUrl) {
-        throw new Error(`Failed to generate URLs for drive file: ${fileId}`);
+      if (shareUrl && contentUrl) {
+        shareUrlMap.set(fileId, shareUrl);
+        contentUrlMap.set(fileId, contentUrl);
       }
-      shareUrlMap.set(fileId, shareUrl);
-      contentUrlMap.set(fileId, contentUrl);
     }
 
     // Replace file-content:// with direct content URLs
@@ -684,7 +807,7 @@ IMPORTANT: Use \`file-content://\` for <img>, <video>, <audio> src attributes. U
 
     // Replace file:// with share page URLs (but not file-content://)
     result = result.replace(
-      /(?<!-)file:\/\/(df-[a-zA-Z0-9]+)/g,
+      /file:\/\/(df-[a-zA-Z0-9]+)/g,
       (match, fileId: string) => shareUrlMap.get(fileId) ?? match,
     );
 
@@ -741,13 +864,19 @@ export class BuiltinReadFile extends AgentBaseTool<BuiltinToolParams> {
 
   schema = z.object({
     fileId: z.string().describe('The ID of the file to read (format: df-xxx, from context)'),
+    fileName: z
+      .string()
+      .optional()
+      .describe('Optional file name for frontend display purpose only'),
   });
 
   description = `Read content from a file.
 
 Supported types:
 - Text files (txt, md, json, csv, js, py, xml, yaml...): Returns raw content
-- PDF / Word (.docx) / EPUB: Returns extracted text (max 3000 words, truncated if exceeded)
+- PDF / Word (.docx) / EPUB: Returns extracted text
+
+Token limit: 25,000 tokens (~100K chars). Large files are truncated with head/tail preservation.
 
 NOT supported: Images, Audio, Video (returns error)
 
@@ -771,11 +900,136 @@ Latency: <2s`;
         summary: `Successfully read file: "${file.name}" with file ID: ${file.fileId}`,
       };
     } catch (error) {
+      const err = error as { code?: string; message?: string };
+      const errorMessage = err.message || 'Unknown error';
+
+      // Check for file size limit error (E3006) - guide LLM to use execute_code
+      if (err.code === 'E3006') {
+        return {
+          status: 'error',
+          error: 'FILE_TOO_LARGE',
+          data: {
+            fileId: input.fileId,
+            fileName: input.fileName,
+            suggestion:
+              'This file exceeds the size limit for direct reading. Use the execute_code tool to process it with custom Python/JavaScript code.',
+          },
+          summary: errorMessage,
+        };
+      }
+
       return {
         status: 'error',
         error: 'Error reading file',
+        data: {
+          fileId: input.fileId,
+          fileName: input.fileName,
+        },
+        summary: errorMessage,
+      };
+    }
+  }
+}
+
+export class BuiltinListFiles extends AgentBaseTool<BuiltinToolParams> {
+  name = 'list_files';
+  toolsetKey = 'list_files';
+
+  schema = z.object({
+    source: z
+      .enum(['manual', 'variable', 'agent'])
+      .optional()
+      .describe(
+        'Filter files by source: manual (user uploaded), variable (from workflow variables), agent (created by agent). If not specified, returns all files.',
+      ),
+  });
+
+  description = `List files in the current canvas.
+
+Returns a list of files with their IDs and names. Use the fileId with read_file tool to read file content.
+
+Optional filter by source:
+- manual: Files uploaded by user
+- variable: Files from workflow variables
+- agent: Files created by agent`;
+
+  protected params: BuiltinToolParams;
+
+  constructor(params: BuiltinToolParams) {
+    super(params);
+    this.params = params;
+  }
+
+  async _call(
+    input: z.infer<typeof this.schema>,
+    _: unknown,
+    config: RunnableConfig,
+  ): Promise<ToolCallResult> {
+    try {
+      const { reflyService, user } = this.params;
+      const canvasId = config.configurable?.canvasId;
+
+      if (!canvasId) {
+        return {
+          status: 'error',
+          error: 'Canvas ID not found in context',
+          summary: 'Cannot list files: canvas context is not available',
+        };
+      }
+
+      const files = await reflyService.listFiles(user, canvasId, input.source);
+
+      if (!files || files.length === 0) {
+        const sourceFilter = input.source ? ` (source: ${input.source})` : '';
+        return {
+          status: 'success',
+          data: input.source ? [] : { manual: [], variable: [], agent: [] },
+          summary: `No files found in the current canvas${sourceFilter}`,
+        };
+      }
+
+      // Simplified file info for LLM consumption
+      const toFileInfo = (f: (typeof files)[0]) => ({
+        fileId: f.fileId,
+        fileName: f.name,
+        type: f.type,
+      });
+
+      // If source filter specified, return flat list; otherwise group by source
+      if (input.source) {
+        return {
+          status: 'success',
+          data: files.map(toFileInfo),
+          summary: `Found ${files.length} ${input.source} file(s): ${files.map((f) => f.name).join(', ')}`,
+        };
+      }
+
+      // Group by source for better LLM understanding
+      const grouped = {
+        manual: files.filter((f) => f.source === 'manual').map(toFileInfo),
+        variable: files.filter((f) => f.source === 'variable').map(toFileInfo),
+        agent: files.filter((f) => f.source === 'agent').map(toFileInfo),
+      };
+
+      const counts = [
+        grouped.manual.length && `${grouped.manual.length} manual`,
+        grouped.variable.length && `${grouped.variable.length} variable`,
+        grouped.agent.length && `${grouped.agent.length} agent`,
+      ]
+        .filter(Boolean)
+        .join(', ');
+
+      return {
+        status: 'success',
+        data: grouped,
+        summary: `Found ${files.length} file(s) in canvas (${counts})`,
+      };
+    } catch (error) {
+      return {
+        status: 'error',
+        error: 'Error listing files',
         summary:
-          error instanceof Error ? error.message : 'Unknown error occurred while reading file',
+          error instanceof Error ? error.message : 'Unknown error occurred while listing files',
       };
     }
   }
@@ -818,6 +1072,11 @@ export class BuiltinReadFileToolset extends AgentBaseToolset<BuiltinToolParams> 
   tools = [BuiltinReadFile] satisfies readonly AgentToolConstructor<BuiltinToolParams>[];
 }
 
+export class BuiltinListFilesToolset extends AgentBaseToolset<BuiltinToolParams> {
+  toolsetKey = BuiltinListFilesDefinition.key;
+  tools = [BuiltinListFiles] satisfies readonly AgentToolConstructor<BuiltinToolParams>[];
+}
+
 export class BuiltinExecuteCodeToolset extends AgentBaseToolset<BuiltinToolParams> {
   toolsetKey = BuiltinExecuteCodeDefinition.key;
   tools = [BuiltinExecuteCode] satisfies readonly AgentToolConstructor<BuiltinToolParams>[];
@@ -832,6 +1091,7 @@ export class BuiltinToolset extends AgentBaseToolset<BuiltinToolParams> {
     BuiltinSendEmail,
     BuiltinGetTime,
     BuiltinReadFile,
+    BuiltinListFiles,
     BuiltinExecuteCode,
   ] satisfies readonly AgentToolConstructor<BuiltinToolParams>[];
 }

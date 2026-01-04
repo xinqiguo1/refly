@@ -4,6 +4,7 @@ import { APP_GUARD } from '@nestjs/core';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { LoggerModule } from 'nestjs-pino';
 import { SkipThrottle, ThrottlerGuard, ThrottlerModule, seconds } from '@nestjs/throttler';
+import { EventEmitterModule } from '@nestjs/event-emitter';
 import api from '@opentelemetry/api';
 
 import { AuthModule } from './auth/auth.module';
@@ -46,6 +47,7 @@ import { DriveModule } from './drive/drive.module';
 import { FormModule } from './form/form.module';
 import { VoucherModule } from './voucher/voucher.module';
 import { CommonModule } from './common/common.module';
+import { ScheduleModule } from './schedule/schedule.module';
 import { RedisService } from './common/redis.service';
 
 import { isDesktop } from '../utils/runtime';
@@ -140,13 +142,21 @@ class CustomThrottlerGuard extends ThrottlerGuard {
     DriveModule,
     FormModule,
     VoucherModule,
+    ScheduleModule,
+    EventEmitterModule.forRoot(),
     ...(isDesktop()
       ? []
       : [
           BullModule.forRootAsync({
             imports: [CommonModule],
             useFactory: (redisService: RedisService) => {
-              return { connection: redisService.getClient() };
+              return {
+                connection: redisService.getClient(),
+                defaultJobOptions: {
+                  removeOnComplete: true,
+                  removeOnFail: true,
+                },
+              };
             },
             inject: [RedisService],
           }),

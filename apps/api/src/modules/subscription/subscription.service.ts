@@ -123,7 +123,7 @@ export class SubscriptionService implements OnModuleInit {
           pattern: '0 * * * *', // Run every hour
         },
         removeOnComplete: true,
-        removeOnFail: false,
+        removeOnFail: true,
         // Add job options for distributed environment
         jobId: 'check-canceled-subscriptions', // Unique job ID to prevent duplicates
         attempts: 3, // Number of retry attempts
@@ -156,7 +156,7 @@ export class SubscriptionService implements OnModuleInit {
           pattern: '*/10 * * * *',
         },
         removeOnComplete: true,
-        removeOnFail: false,
+        removeOnFail: true,
         // Add job options for distributed environment
         jobId: 'expire-and-recharge-credits', // Unique job ID to prevent duplicates
         attempts: 3, // Number of retry attempts
@@ -171,7 +171,7 @@ export class SubscriptionService implements OnModuleInit {
 
   async createCheckoutSession(user: User, param: CreateCheckoutSessionRequest) {
     const { uid } = user;
-    const { planType, interval, voucherId } = param;
+    const { planType, interval, voucherId, voucherEntryPoint, voucherUserType } = param;
     const userPo = await this.prisma.user.findUnique({ where: { uid } });
 
     const plan = await this.prisma.subscriptionPlan.findFirst({
@@ -193,6 +193,7 @@ export class SubscriptionService implements OnModuleInit {
     // Validate and get voucher promotion code if provided
     let stripePromoCodeId: string | undefined;
     let validatedVoucherId: string | undefined;
+    let voucherDiscountPercent: number | undefined;
     if (voucherId) {
       const voucherValidation = await this.voucherService.validateVoucher(uid, voucherId);
       if (voucherValidation.valid && voucherValidation.voucher) {
@@ -200,6 +201,7 @@ export class SubscriptionService implements OnModuleInit {
         if (voucherValidation.voucher.stripePromoCodeId) {
           stripePromoCodeId = voucherValidation.voucher.stripePromoCodeId;
           validatedVoucherId = voucherId;
+          voucherDiscountPercent = voucherValidation.voucher.discountPercent;
           this.logger.log(
             `Using Stripe promotion code ${stripePromoCodeId} for voucher ${voucherId} (${voucherValidation.voucher.discountPercent}% off)`,
           );
@@ -247,7 +249,14 @@ export class SubscriptionService implements OnModuleInit {
       consent_collection: {
         terms_of_service: 'required',
       },
-      metadata: validatedVoucherId ? { voucherId: validatedVoucherId } : undefined,
+      metadata: validatedVoucherId
+        ? {
+            voucherId: validatedVoucherId,
+            voucherDiscountPercent: voucherDiscountPercent?.toString(),
+            voucherEntryPoint,
+            voucherUserType,
+          }
+        : undefined,
     };
 
     // Apply voucher promotion code or allow promotion codes (not both)

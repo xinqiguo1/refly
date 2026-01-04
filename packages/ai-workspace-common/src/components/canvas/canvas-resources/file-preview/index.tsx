@@ -4,8 +4,8 @@ import { DriveFile } from '@refly/openapi-schema';
 import { File } from 'refly-icons';
 import { getCodeLanguage } from '@refly-packages/ai-workspace-common/utils/file-type';
 import { useDriveFileUrl } from '@refly-packages/ai-workspace-common/hooks/canvas/use-drive-file-url';
+import { useDownloadFile } from '@refly-packages/ai-workspace-common/hooks/canvas/use-download-file';
 import { cn } from '@refly/utils/cn';
-import { useMatch } from 'react-router-dom';
 
 // Import renderer components
 import type { FileContent } from './types';
@@ -19,19 +19,6 @@ import { AudioRenderer } from './audio';
 import { UnsupportedRenderer } from './unsupported';
 import { HtmlRenderer } from './html';
 import { MarkdownRenderer } from './markdown';
-
-const useHandleDownload = (url: string | undefined, fileName: string) => {
-  return useCallback(() => {
-    if (!url) return;
-
-    const link = document.createElement('a');
-    link.href = `${url}?download=1`;
-    link.download = fileName;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  }, [url, fileName]);
-};
 
 interface ContentCategoryResult {
   category: string;
@@ -92,17 +79,22 @@ interface FilePreviewProps {
   file: DriveFile;
   markdownClassName?: string;
   source?: 'card' | 'preview';
+  disableTruncation?: boolean;
+  purePreview?: boolean;
 }
 
 export const FilePreview = memo(
-  ({ file, markdownClassName = '', source = 'card' }: FilePreviewProps) => {
+  ({
+    file,
+    markdownClassName = '',
+    source = 'card',
+    disableTruncation = false,
+    purePreview = false,
+  }: FilePreviewProps) => {
     const [fileContent, setFileContent] = useState<FileContent | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [activeTab, setActiveTab] = useState<'code' | 'preview'>('preview');
-
-    // Check if current page is a share page
-    const isShareFile = useMatch('/share/file/:shareId');
 
     // useFileUrl now automatically fetches publicURL if needed in share pages
     const { fileUrl, isLoading: isLoadingUrl } = useDriveFileUrl({ file });
@@ -165,7 +157,11 @@ export const FilePreview = memo(
       };
     }, [fetchFileContent]);
 
-    const handleDownload = useHandleDownload(fileContent?.url, file.name);
+    const contentType = (file?.type ?? '') as string;
+    const { handleDownload: downloadFile, isDownloading } = useDownloadFile();
+    const handleDownload = useCallback(() => {
+      downloadFile({ currentFile: file, contentType });
+    }, [downloadFile, file, contentType]);
 
     const handleTabChange = useCallback((tab: 'code' | 'preview') => {
       setActiveTab(tab);
@@ -177,9 +173,8 @@ export const FilePreview = memo(
       if (!fileContent) return null;
 
       const { category, language } = extractContentCategory(fileContent.contentType, file.name);
-      const isCardMode = source === 'card' || !!isShareFile;
 
-      const rendererSource = isCardMode ? 'card' : 'preview';
+      const rendererSource = source;
 
       switch (category) {
         case 'svg':
@@ -194,6 +189,8 @@ export const FilePreview = memo(
               file={file}
               activeTab={activeTab}
               onTabChange={handleTabChange}
+              disableTruncation={disableTruncation}
+              purePreview={purePreview}
             />
           );
         case 'markdown':
@@ -205,6 +202,7 @@ export const FilePreview = memo(
               className={markdownClassName}
               activeTab={activeTab}
               onTabChange={handleTabChange}
+              disableTruncation={disableTruncation}
             />
           );
         case 'code':
@@ -216,6 +214,7 @@ export const FilePreview = memo(
               language={language!}
               activeTab={activeTab}
               onTabChange={handleTabChange}
+              disableTruncation={disableTruncation}
             />
           );
         case 'text':
@@ -225,12 +224,20 @@ export const FilePreview = memo(
               fileContent={fileContent}
               file={file}
               className={markdownClassName}
+              disableTruncation={disableTruncation}
             />
           );
         case 'pdf':
           return <PdfRenderer fileContent={fileContent} file={file} />;
         case 'json':
-          return <JsonRenderer source={rendererSource} fileContent={fileContent} file={file} />;
+          return (
+            <JsonRenderer
+              source={rendererSource}
+              fileContent={fileContent}
+              file={file}
+              disableTruncation={disableTruncation}
+            />
+          );
         case 'video':
           return <VideoRenderer fileContent={fileContent} file={file} />;
         case 'audio':
@@ -241,15 +248,20 @@ export const FilePreview = memo(
               fileContent={fileContent}
               file={file}
               onDownload={handleDownload}
+              isDownloading={isDownloading}
             />
           );
       }
     };
 
+    // Check if the file is a video to skip max-height constraint
+    const isVideo = file?.type?.startsWith('video/');
+
     return (
       <div
-        className={cn('flex-1 h-full overflow-hidden', {
-          'max-h-[230px]': source === 'card',
+        className={cn('flex-1 overflow-hidden', {
+          'h-full': !isVideo,
+          'max-h-[230px]': source === 'card' && !isVideo,
         })}
       >
         {renderFilePreview()}

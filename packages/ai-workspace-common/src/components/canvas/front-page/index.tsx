@@ -129,7 +129,7 @@ export const SettingItem = React.memo(
     const handleSubscriptionClick = useCallback(
       (e: React.MouseEvent) => {
         e.stopPropagation();
-        setSubscribeModalVisible(true);
+        setSubscribeModalVisible(true, 'canvas');
       },
       [setSubscribeModalVisible],
     );
@@ -389,7 +389,7 @@ export const FrontPage = memo(() => {
         <title>{t('loggedHomePage.siderMenu.home')}</title>
       </Helmet>
 
-      <div className="absolute top-4 right-[1px] z-10">
+      <div className="absolute top-5 right-5 z-10">
         <SettingItem showName={false} avatarAlign={'right'} />
       </div>
 

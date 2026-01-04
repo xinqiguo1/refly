@@ -69,8 +69,15 @@ Assume unlimited context. Keep iterating; do not give up prematurely.
 - **Use when**: Time queries with high tolerance for slight inaccuracy
 - **Example**: "What's the weather next week?" → need approximate current date
 
+#### \`list_files\`
+- **Latency**: <1s
+- **Use when**: Need to see what files are available in the current canvas
+- **Returns**: List of files with \`fileId\` and \`fileName\`
+- **Note**: Use the returned \`fileId\` with \`read_file\` to read file content
+
 #### \`read_file\`
 - **Use when**: Quick content overview, check file structure (e.g., CSV first rows)
+- **Input**: \`fileId\` (from context or \`list_files\`), optional \`fileName\` for display
 - **NOT for**:
   - Content already in context (base64 images, inline text)
   - Complex data processing (use \`execute_code\` instead)
@@ -99,9 +106,18 @@ Assume unlimited context. Keep iterating; do not give up prematurely.
 
 ## Context (system-injected)
 
-- \`files\`: uploaded/referenced files; use \`fileId\` with \`read_file\`, use \`name\` with \`execute_code\`
+- \`files\`: uploaded/referenced files (**metadata only**: name, fileId, type, summary)
+  - **Important**: File content is NOT included to save context tokens
+  - Use \`read_file\` tool with \`fileId\` to retrieve full content when needed
+  - Use \`name\` with \`execute_code\` for file processing
 - \`results\`: outputs from upstream nodes; access via \`@agent:Title\` mention
+  - \`outputFiles\`: metadata only, use \`read_file\` to get content
 - \`summary\` fields: quick preview without reading full content
+
+### File Access Strategy
+1. **Check summary first** — often sufficient for understanding file purpose
+2. **Use read_file when needed** — call only when full content is required
+3. **Batch when possible** — read multiple files together in execute_code if processing
 
 ### @ Mentions
 

@@ -313,7 +313,7 @@ const PlusPlanCard = memo(
               </Tag>
             )}
           </div>
-          {voucher && !isCurrentPlan && voucherValidDays && (
+          {voucher && !isCurrentPlan && voucherValidDays && selectedId !== 'yearly' && (
             <VoucherTag discountPercent={voucher.discountPercent} validDays={voucherValidDays} />
           )}
         </div>
@@ -488,9 +488,11 @@ export const CreditInsufficientModal = memo(() => {
     fetchVouchers();
   }, [creditInsufficientModalVisible, isLogin, setAvailableVoucher, setVoucherLoading]);
 
-  // If triggered from canvas and user is free, don't show credit packs
+  // If triggered from canvas or schedule and user is free, don't show credit packs
   const isTriggeredFromCanvas = creditInsufficientTriggeredFrom === 'canvas';
-  const shouldShowCreditPacks = !isTriggeredFromCanvas || hasPaidSubscription;
+  const isTriggeredFromSchedule = creditInsufficientTriggeredFrom === 'schedule';
+  const shouldShowCreditPacks =
+    (!isTriggeredFromCanvas && !isTriggeredFromSchedule) || hasPaidSubscription;
 
   // Determine if showing both cards (free user not from canvas) or single card
   const showBothCards = !hasPaidSubscription && shouldShowCreditPacks;
@@ -577,6 +579,8 @@ export const CreditInsufficientModal = memo(() => {
           currentPlan?: string;
           source?: string;
           voucherId?: string;
+          voucherEntryPoint?: string;
+          voucherUserType?: string;
         } = {
           planType: 'plus' as SubscriptionPlanType,
           interval: interval,
@@ -584,8 +588,8 @@ export const CreditInsufficientModal = memo(() => {
           source: creditInsufficientTriggeredFrom,
         };
 
-        // Validate voucher before creating checkout session
-        if (availableVoucher?.voucherId) {
+        // Validate voucher before creating checkout session (only for monthly subscriptions)
+        if (availableVoucher?.voucherId && interval !== 'yearly') {
           console.log('[CreditInsufficientModal] Validating voucher:', availableVoucher.voucherId);
           const validateRes = await getClient().validateVoucher({
             body: { voucherId: availableVoucher.voucherId },
@@ -598,13 +602,9 @@ export const CreditInsufficientModal = memo(() => {
 
           if (validateRes.data?.data?.valid) {
             body.voucherId = availableVoucher.voucherId;
+            body.voucherEntryPoint = 'canvas';
+            body.voucherUserType = userType;
             console.log('[CreditInsufficientModal] Voucher added to body:', body.voucherId);
-
-            logEvent('voucher_applied', null, {
-              voucher_value: Math.round((100 - availableVoucher.discountPercent) / 10),
-              entry_point: 'credit_insufficient_modal',
-              user_type: userType,
-            });
           } else {
             const reason = validateRes.data?.data?.reason || 'Voucher is no longer valid';
             message.warning(
@@ -678,7 +678,12 @@ export const CreditInsufficientModal = memo(() => {
       onCancel={handleClose}
       title={
         <span className="text-xl font-semibold text-gray-900">
-          {t('canvas.skillResponse.creditInsufficient.title', 'Insufficient Credits')}
+          {creditInsufficientTriggeredFrom === 'schedule'
+            ? t(
+                'canvas.skillResponse.creditInsufficient.scheduleTitle',
+                'Upgrade to Create More Schedules',
+              )
+            : t('canvas.skillResponse.creditInsufficient.title', 'Insufficient Credits')}
         </span>
       }
       className="credit-insufficient-modal"

@@ -27,12 +27,14 @@ import { McpServerModule } from '../mcp-server/mcp-server.module';
 import { MediaGeneratorModule } from '../media-generator/media-generator.module';
 import { SkillEngineService } from './skill-engine.service';
 import { SkillInvokerService } from './skill-invoker.service';
+import { SkillInvokeMetrics } from './skill-invoke.metrics';
 import { isDesktop } from '../../utils/runtime';
 import { ActionModule } from '../action/action.module';
 import { ToolModule } from '../tool/tool.module';
 import { ToolCallModule } from '../tool-call/tool-call.module';
 import { DriveModule } from '../drive/drive.module';
 import { CanvasSyncModule } from '../canvas-sync/canvas-sync.module';
+import { WorkflowPlanModule } from '../workflow/workflow-plan.module';
 
 @Module({
   imports: [
@@ -54,18 +56,12 @@ import { CanvasSyncModule } from '../canvas-sync/canvas-sync.module';
     McpServerModule,
     MediaGeneratorModule,
     CanvasSyncModule,
+    WorkflowPlanModule,
     ...(isDesktop()
       ? []
       : [
           BullModule.registerQueue({ name: QUEUE_SKILL }),
-          BullModule.registerQueue({
-            name: QUEUE_CHECK_STUCK_ACTIONS,
-            prefix: 'skill_cron',
-            defaultJobOptions: {
-              removeOnComplete: true,
-              removeOnFail: false,
-            },
-          }),
+          BullModule.registerQueue({ name: QUEUE_CHECK_STUCK_ACTIONS, prefix: 'skill_cron' }),
           BullModule.registerQueue({ name: QUEUE_SYNC_TOKEN_USAGE }),
           BullModule.registerQueue({ name: QUEUE_SYNC_TOKEN_CREDIT_USAGE }),
           BullModule.registerQueue({ name: QUEUE_SYNC_REQUEST_USAGE }),
@@ -77,6 +73,7 @@ import { CanvasSyncModule } from '../canvas-sync/canvas-sync.module';
     SkillService,
     SkillEngineService,
     SkillInvokerService,
+    SkillInvokeMetrics,
     ...(isDesktop() ? [] : [SkillProcessor, CheckStuckActionsProcessor]),
   ],
   controllers: [SkillController],

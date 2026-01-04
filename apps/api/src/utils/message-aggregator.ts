@@ -101,11 +101,13 @@ export class MessageAggregator {
    * Persist all dirty messages to the database
    */
   private async persistDirtyMessages(): Promise<void> {
-    if (!this.prisma || this.isFlushing) return;
+    if (!this.prisma) return;
+    if (this.isFlushing) return;
 
     const dirtyMessages = this.messages.filter((msg) => msg.dirty);
     if (dirtyMessages.length === 0) return;
 
+    this.isFlushing = true;
     try {
       const newMessages = dirtyMessages.filter((msg) => !msg.persisted);
       const updatedMessages = dirtyMessages.filter((msg) => msg.persisted);
@@ -113,7 +115,7 @@ export class MessageAggregator {
       // Create new messages
       if (newMessages.length > 0) {
         const createData = newMessages.map((msg) => this.toPrismaInput(msg));
-        await this.prisma.actionMessage.createMany({ data: createData });
+        await this.prisma.actionMessage.createMany({ data: createData, skipDuplicates: true });
 
         // Mark as persisted
         for (const msg of newMessages) {
@@ -138,6 +140,8 @@ export class MessageAggregator {
     } catch (error) {
       console.error('[MessageAggregator] Failed to persist dirty messages:', error);
       throw error;
+    } finally {
+      this.isFlushing = false;
     }
   }
 
@@ -353,14 +357,7 @@ export class MessageAggregator {
     if (!this.prisma) {
       return;
     }
-
-    this.isFlushing = true;
-
-    try {
-      await this.persistDirtyMessages();
-    } finally {
-      this.isFlushing = false;
-    }
+    await this.persistDirtyMessages();
   }
 
   /**

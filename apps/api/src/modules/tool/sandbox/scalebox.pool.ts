@@ -4,7 +4,7 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { PinoLogger } from 'nestjs-pino';
 
-import { guard } from '../../../utils/guard';
+import { guard } from '@refly/utils';
 import { QUEUE_SCALEBOX_PAUSE, QUEUE_SCALEBOX_KILL } from '../../../utils/const';
 import { Config } from '../../config/config.decorator';
 
@@ -14,7 +14,7 @@ import { SandboxWrapperFactory } from './scalebox.factory';
 import { ExecutionContext, SandboxPauseJobData, SandboxKillJobData } from './scalebox.dto';
 import { ScaleboxStorage } from './scalebox.storage';
 import { SCALEBOX_DEFAULTS } from './scalebox.constants';
-import { Trace } from './scalebox.tracer';
+import { Trace } from '@refly/observability';
 
 @Injectable()
 export class SandboxPool {

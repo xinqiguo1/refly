@@ -4,9 +4,12 @@ import { PinoLogger } from 'nestjs-pino';
 import mime from 'mime';
 import pLimit from 'p-limit';
 import pdf from 'pdf-parse';
+import sharp from 'sharp';
 import { PrismaService } from '../common/prisma.service';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../common/redis.service';
+import { Trace, getCurrentSpan, getTracer } from '@refly/observability';
+import { SpanStatusCode } from '@opentelemetry/api';
 import {
   UpsertDriveFileRequest,
   DeleteDriveFileRequest,
@@ -25,7 +28,13 @@ import {
   isPlainTextMimeType,
   pick,
 } from '@refly/utils';
-import { ParamsError, DriveFileNotFoundError, DocumentNotFoundError } from '@refly/errors';
+import { truncateContent } from '@refly/utils/token';
+import {
+  ParamsError,
+  DriveFileNotFoundError,
+  DocumentNotFoundError,
+  FileTooLargeError,
+} from '@refly/errors';
 import { ObjectStorageService, OSS_INTERNAL, OSS_EXTERNAL } from '../common/object-storage';
 import { streamToBuffer, streamToString } from '../../utils';
 import { driveFilePO2DTO } from './drive.dto';
@@ -38,6 +47,7 @@ import { readingTime } from 'reading-time-estimator';
 import { MiscService } from '../misc/misc.service';
 import { DocxParser } from '../knowledge/parsers/docx.parser';
 import { PdfParser } from '../knowledge/parsers/pdf.parser';
+import { ObjectInfo } from '../common/object-storage/backend/interface';
 
 export interface ExtendedUpsertDriveFileRequest extends UpsertDriveFileRequest {
   buffer?: Buffer;
@@ -152,7 +162,7 @@ export class DriveService implements OnModuleInit {
     while (attempts < 100) {
       // Prevent infinite loop
       const randomSuffix = Math.random().toString(36).substring(2, 7); // 5-character random string
-      const newName = `${nameWithoutExt}-${randomSuffix}${extension}`;
+      const newName = `${nameWithoutExt}-${Date.now()}-${randomSuffix}${extension}`;
 
       if (!existingNames.has(newName)) {
         return newName;
@@ -270,6 +280,7 @@ export class DriveService implements OnModuleInit {
 
           // Move object in storage
           await this.internalOss.moveObject(originalStorageKey, archiveStorageKey);
+          await this.externalOss.moveObject(originalStorageKey, archiveStorageKey);
 
           this.logger.debug(`Successfully archived file ${file.fileId} to ${archiveStorageKey}`);
           return { success: true, fileId: file.fileId };
@@ -371,124 +382,117 @@ export class DriveService implements OnModuleInit {
     },
   ): Promise<ProcessedUpsertDriveFileResult[]> {
     // Acquire lock to prevent concurrent file processing for the same canvas
-    const lockKey = `drive:canvas:${canvasId}`;
-    const releaseLock = await this.redis.waitLock(lockKey);
+    // const lockKey = `drive:canvas:${canvasId}`;
+    // const releaseLock = await this.redis.waitLock(lockKey);
+    const presentFiles = await this.prisma.driveFile.findMany({
+      select: { name: true },
+      where: { canvasId, scope: 'present', deletedAt: null },
+    });
 
-    try {
-      const presentFiles = await this.prisma.driveFile.findMany({
-        select: { name: true },
-        where: { canvasId, scope: 'present', deletedAt: null },
-      });
+    // Create a set of existing filenames for quick lookup
+    const existingFileNames = new Set(presentFiles.map((file) => file.name));
 
-      // Create a set of existing filenames for quick lookup
-      const existingFileNames = new Set(presentFiles.map((file) => file.name));
+    const results: ProcessedUpsertDriveFileResult[] = [];
 
-      const results: ProcessedUpsertDriveFileResult[] = [];
+    // Process each request in the batch
+    for (const request of requests) {
+      const { canvasId, name, content, storageKey, externalUrl, buffer, type } = request;
 
-      // Process each request in the batch
-      for (const request of requests) {
-        const { canvasId, name, content, storageKey, externalUrl, buffer, type } = request;
+      // Generate unique filename to avoid conflicts
+      const uniqueName = this.generateUniqueFileName(name, existingFileNames);
+      existingFileNames.add(uniqueName); // Add to set to prevent future conflicts in this batch
 
-        // Generate unique filename to avoid conflicts
-        const uniqueName = this.generateUniqueFileName(name, existingFileNames);
-        existingFileNames.add(uniqueName); // Add to set to prevent future conflicts in this batch
-
-        // Skip requests that don't have content to process
-        if (content === undefined && !storageKey && !externalUrl && !buffer) {
-          continue;
-        }
-
-        let source = request.source;
-        if (request.variableId) {
-          source = 'variable';
-        } else if (request.resultId) {
-          source = 'agent';
-        }
-
-        // Generate drive storage path
-        const driveStorageKey = this.generateStorageKey(user, {
-          canvasId,
-          name: uniqueName,
-          source,
-          scope: 'present',
-        });
-
-        let rawData: Buffer;
-        let size: bigint;
-
-        if (buffer) {
-          // Case 0: Buffer upload
-          rawData = buffer;
-          size = BigInt(rawData.length);
-        } else if (content !== undefined) {
-          // Case 1: Direct content upload
-          rawData = Buffer.from(content, 'utf8');
-          size = BigInt(rawData.length);
-          // Infer MIME type from filename, fallback to text/plain
-          request.type =
-            getSafeMimeType(name, mime.getType(name) ?? type ?? undefined) || 'text/plain';
-        } else if (storageKey) {
-          // Case 2: Transfer from existing storage key
-          let objectInfo = await this.internalOss.statObject(storageKey);
-          if (!objectInfo) {
-            throw new ParamsError(`Source file not found: ${storageKey}`);
-          }
-
-          if (storageKey !== driveStorageKey) {
-            objectInfo = await this.internalOss.duplicateFile(storageKey, driveStorageKey);
-          }
-
-          size = BigInt(objectInfo?.size ?? 0);
-          request.type =
-            objectInfo?.metaData?.['Content-Type'] ??
-            getSafeMimeType(name, mime.getType(name) ?? undefined);
-        } else if (externalUrl) {
-          // Case 3: Download from external URL
-          rawData = await this.downloadFileFromUrl(externalUrl);
-          size = BigInt(rawData.length);
-
-          // Determine content type based on file extension or default to binary
-          request.type = getSafeMimeType(name, mime.getType(name) ?? undefined);
-        }
-
-        if (options?.archiveFiles) {
-          if (request.variableId) {
-            await this.archiveFiles(user, canvasId, {
-              source: 'variable',
-              variableId: request.variableId,
-            });
-          } else if (request.resultId) {
-            await this.archiveFiles(user, canvasId, {
-              source: 'agent',
-              resultId: request.resultId,
-            });
-          }
-        }
-
-        if (rawData) {
-          const headers: Record<string, string> = {};
-          const formattedContentType = this.appendUtf8CharsetIfNeeded(request.type);
-          if (formattedContentType) {
-            headers['Content-Type'] = formattedContentType;
-          }
-          await this.internalOss.putObject(driveStorageKey, rawData, headers);
-        }
-
-        results.push({
-          ...request,
-          name: uniqueName,
-          driveStorageKey,
-          size,
-          source,
-          category: getFileCategory(request.type),
-        });
+      // Skip requests that don't have content to process
+      if (content === undefined && !storageKey && !externalUrl && !buffer) {
+        continue;
       }
 
-      return results;
-    } finally {
-      // Always release the lock
-      await releaseLock();
+      let source = request.source;
+      if (request.variableId) {
+        source = 'variable';
+      } else if (request.resultId) {
+        source = 'agent';
+      }
+
+      // Generate drive storage path
+      const driveStorageKey = this.generateStorageKey(user, {
+        canvasId,
+        name: uniqueName,
+        source,
+        scope: 'present',
+      });
+
+      let rawData: Buffer;
+      let size: bigint;
+
+      if (buffer) {
+        // Case 0: Buffer upload
+        rawData = buffer;
+        size = BigInt(rawData.length);
+      } else if (content !== undefined) {
+        // Case 1: Direct content upload
+        rawData = Buffer.from(content, 'utf8');
+        size = BigInt(rawData.length);
+        // Infer MIME type from filename, fallback to text/plain
+        request.type =
+          getSafeMimeType(name, mime.getType(name) ?? type ?? undefined) || 'text/plain';
+      } else if (storageKey) {
+        // Case 2: Transfer from existing storage key
+        let objectInfo = await this.internalOss.statObject(storageKey);
+        if (!objectInfo) {
+          throw new ParamsError(`Source file not found: ${storageKey}`);
+        }
+
+        if (storageKey !== driveStorageKey) {
+          objectInfo = await this.internalOss.duplicateFile(storageKey, driveStorageKey);
+        }
+
+        size = BigInt(objectInfo?.size ?? 0);
+        request.type =
+          objectInfo?.metaData?.['Content-Type'] ??
+          getSafeMimeType(name, mime.getType(name) ?? undefined);
+      } else if (externalUrl) {
+        // Case 3: Download from external URL
+        rawData = await this.downloadFileFromUrl(externalUrl);
+        size = BigInt(rawData.length);
+
+        // Determine content type based on file extension or default to binary
+        request.type = getSafeMimeType(name, mime.getType(name) ?? undefined);
+      }
+
+      if (options?.archiveFiles) {
+        if (request.variableId) {
+          await this.archiveFiles(user, canvasId, {
+            source: 'variable',
+            variableId: request.variableId,
+          });
+        } else if (request.resultId) {
+          await this.archiveFiles(user, canvasId, {
+            source: 'agent',
+            resultId: request.resultId,
+          });
+        }
+      }
+
+      if (rawData) {
+        const headers: Record<string, string> = {};
+        const formattedContentType = this.appendUtf8CharsetIfNeeded(request.type);
+        if (formattedContentType) {
+          headers['Content-Type'] = formattedContentType;
+        }
+        await this.internalOss.putObject(driveStorageKey, rawData, headers);
+      }
+
+      results.push({
+        ...request,
+        name: uniqueName,
+        driveStorageKey,
+        size,
+        source,
+        category: getFileCategory(request.type),
+      });
     }
+    return results;
   }
 
   /**
@@ -512,7 +516,7 @@ export class DriveService implements OnModuleInit {
 
     if (includeContent) {
       return Promise.all(
-        driveFiles.map((file) => this.getDriveFileDetail(user, file.fileId, file)),
+        driveFiles.map((file) => this.getDriveFileDetail(user, file.fileId, { file })),
       );
     }
     return driveFiles.map((file) => this.toDTO(file));
@@ -554,7 +558,15 @@ export class DriveService implements OnModuleInit {
     return allFiles;
   }
 
-  async getDriveFileDetail(user: User, fileId: string, file?: DriveFileModel): Promise<DriveFile> {
+  @Trace('drive.getDriveFileDetail')
+  async getDriveFileDetail(
+    user: User,
+    fileId: string,
+    options?: { file?: DriveFileModel; includeContent?: boolean },
+  ): Promise<DriveFile> {
+    getCurrentSpan()?.setAttribute('file.id', fileId);
+
+    const { file, includeContent = true } = options ?? {};
     const driveFile =
       file ??
       (await this.prisma.driveFile.findFirst({
@@ -562,6 +574,11 @@ export class DriveService implements OnModuleInit {
       }));
     if (!driveFile) {
       throw new DriveFileNotFoundError(`Drive file not found: ${fileId}`);
+    }
+
+    // Skip content loading if not needed (metadata only)
+    if (!includeContent) {
+      return this.toDTO(driveFile);
     }
 
     let content = driveFile.summary;
@@ -580,9 +597,17 @@ export class DriveService implements OnModuleInit {
         content = driveFile.summary;
       }
 
+      // Apply token-based truncation (head/tail preservation)
+      const maxTokens = this.config.get<number>('drive.maxContentTokens') || 25000;
+      const truncateStart = performance.now();
+      const truncatedContent = truncateContent(content, maxTokens);
+      this.logger.info(
+        `[getDriveFileDetail] truncateContent: fileId=${fileId}, len=${content.length}, time=${(performance.now() - truncateStart).toFixed(2)}ms`,
+      );
+
       return {
         ...this.toDTO(driveFile),
-        content,
+        content: truncatedContent,
       };
     }
 
@@ -602,42 +627,29 @@ export class DriveService implements OnModuleInit {
         .replace(/[ \t]+/g, ' ')
         // Compress more than 2 consecutive line breaks to 2 line breaks
         .replace(/\n{3,}/g, '\n\n')
+        // Normalize excessive horizontal rules (4+ dashes/underscores/equals) to standard markdown hr
+        .replace(/^[ \t]*[-_=]{4,}[ \t]*$/gm, '---')
+        // Deduplicate consecutive horizontal rules (--- followed by newlines and ---)
+        .replace(/(^---\n)+---$/gm, '---')
         // Trim whitespace at start and end of each line
         .split('\n')
         .map((line) => line.trim())
         .join('\n')
+        // Deduplicate consecutive horizontal rules after trimming
+        .replace(/(\n---)+\n---/g, '\n---')
         // Trim overall content
         .trim()
     );
   }
 
   /**
-   * Truncate content by keeping head and tail, removing middle section
-   * @param content - Original content
-   * @param maxWords - Maximum word count to keep
-   * @returns Truncated content with ellipsis in the middle
-   */
-  private truncateContent(content: string, maxWords: number): string {
-    const words = content.split(/\s+/).filter((w) => w.length > 0);
-
-    if (words.length <= maxWords) {
-      return content;
-    }
-
-    const headWords = Math.floor(maxWords * 0.4); // Keep 40% at the beginning
-    const tailWords = Math.floor(maxWords * 0.4); // Keep 40% at the end
-
-    const head = words.slice(0, headWords).join('');
-    const tail = words.slice(-tailWords).join('');
-
-    return `${head}\n\n...[content truncated, ${words.length - maxWords} words removed]...\n\n${tail}`;
-  }
-
-  /**
    * Load drive file content from cache or parse if not cached
    */
+  @Trace('drive.loadOrParseDriveFile')
   private async loadOrParseDriveFile(user: User, driveFile: DriveFileModel): Promise<DriveFile> {
     const { fileId, type: contentType } = driveFile;
+    const tracer = getTracer();
+    getCurrentSpan()?.setAttributes({ 'file.id': fileId, 'file.type': contentType });
 
     this.logger.info(`Loading or parsing drive file ${fileId}, contentType: ${contentType}`);
 
@@ -647,59 +659,81 @@ export class DriveService implements OnModuleInit {
     });
 
     if (cache?.parseStatus === 'success') {
-      try {
-        const stream = await this.internalOss.getObject(cache.contentStorageKey);
-        let content = await streamToBuffer(stream).then((b) => b.toString('utf8'));
+      return tracer
+        .startActiveSpan('drive.loadFromCache', async (span) => {
+          try {
+            const stream = await this.internalOss.getObject(cache.contentStorageKey);
+            let content = await streamToBuffer(stream).then((b) => b.toString('utf8'));
 
-        content = content?.replace(/x00/g, '') || '';
-        content = this.normalizeWhitespace(content);
+            const maxTokens = this.config.get<number>('drive.maxContentTokens') || 25000;
+            const originalLen = content.length;
+            const truncateStart = performance.now();
+            content = truncateContent(content, maxTokens);
+            this.logger.info(
+              `[loadOrParseDriveFile] truncateContent from cache: fileId=${fileId}, len=${originalLen}, time=${(performance.now() - truncateStart).toFixed(2)}ms`,
+            );
 
-        // Truncate content if it exceeds max word limit before storing
-        const maxWords = this.config.get<number>('drive.maxContentWords') || 3000;
-        content = this.truncateContent(content, maxWords);
+            span.setAttributes({ 'cache.hit': true, 'content.length': content.length });
+            span.end();
+            return { ...this.toDTO(driveFile), content };
+          } catch (error) {
+            this.logger.warn(`Cache read failed for ${fileId}, will re-parse:`, error);
+            span.setAttributes({ 'cache.hit': false, 'cache.error': true });
+            span.end();
+            throw error; // Rethrow to continue to parse below
+          }
+        })
+        .catch(() => null); // Return null to continue parsing if cache fails
+    }
 
-        this.logger.info(
-          `Successfully loaded from cache for ${fileId}, content length: ${content.length}`,
-        );
-        return { ...this.toDTO(driveFile), content };
-      } catch (error) {
-        this.logger.warn(`Cache read failed for ${fileId}, will re-parse:`, error);
-        // Continue to parse
-      }
+    // Check file size limit before downloading - large files should use execute_code tool
+    const storageKey = driveFile.storageKey ?? this.generateStorageKey(user, driveFile);
+    const maxFileSizeKB = this.config.get<number>('drive.maxParseFileSizeKB') || 512;
+    const maxFileSizeBytes = maxFileSizeKB * 1024;
+
+    let fileStat: ObjectInfo | undefined;
+    try {
+      fileStat = await this.internalOss.statObject(storageKey);
+    } catch (error) {
+      this.logger.error(`Failed to stat drive file ${fileId}: ${(error as Error)?.message}`);
+      throw new DriveFileNotFoundError(`Drive file not found: ${fileId}`);
+    }
+
+    if (fileStat && fileStat.size > maxFileSizeBytes) {
+      const fileSizeKB = Math.round(fileStat.size / 1024);
+      this.logger.info(
+        `Drive file ${fileId} exceeds size limit: ${fileSizeKB}KB > ${maxFileSizeKB}KB`,
+      );
+      throw new FileTooLargeError(
+        'File exceeds size limit. Use execute_code tool to process this file.',
+        fileSizeKB,
+      );
     }
 
     // Step 2: No cache found, perform parsing
+    getCurrentSpan()?.setAttribute('cache.hit', false);
     try {
-      this.logger.info(`No cache found for ${fileId}, starting parse process`);
-
-      const parserFactory = new ParserFactory(this.config, this.providerService);
-      const parser = await parserFactory.createDocumentParser(user, contentType, {
-        resourceId: fileId,
-      });
-
       // Load file from storage
-      const storageKey = driveFile.storageKey ?? this.generateStorageKey(user, driveFile);
-      const fileStream = await this.internalOss.getObject(storageKey);
-      const fileBuffer = await streamToBuffer(fileStream);
-      this.logger.info(`File loaded from storage for ${fileId}, size: ${fileBuffer.length} bytes`);
+      const fileBuffer = await tracer.startActiveSpan('drive.loadFromOSS', async (span) => {
+        const storageKey = driveFile.storageKey ?? this.generateStorageKey(user, driveFile);
+        const fileStream = await this.internalOss.getObject(storageKey);
+        const buffer = await streamToBuffer(fileStream);
+        span.setAttribute('file.size', buffer.length);
+        span.end();
+        return buffer;
+      });
 
       // Check PDF page count
       let numPages: number | undefined = undefined;
       if (contentType === 'application/pdf') {
         const pdfInfo = await pdf(fileBuffer);
         numPages = pdfInfo.numpages;
+        getCurrentSpan()?.setAttribute('pdf.pages', numPages);
 
-        // Check page limit
         const { available, pageUsed, pageLimit } =
           await this.subscriptionService.checkFileParseUsage(user);
 
         if (numPages > available) {
-          const errorMessage = `Page limit exceeded: ${numPages} pages, available: ${available}`;
-          this.logger.info(
-            `Drive file ${fileId} parse failed due to page limit, numpages: ${numPages}, available: ${available}`,
-          );
-
-          // Record failure status
           await this.prisma.driveFileParseCache.upsert({
             where: { fileId },
             create: {
@@ -724,34 +758,56 @@ export class DriveService implements OnModuleInit {
               updatedAt: new Date(),
             },
           });
-
-          throw new Error(errorMessage);
+          throw new Error(`Page limit exceeded: ${numPages} pages, available: ${available}`);
         }
       }
 
-      // Perform parsing
-      this.logger.info(`Starting to parse file ${fileId} with parser: ${parser.name}`);
-      const result = await parser.parse(fileBuffer);
-      if (result.error) {
-        throw new Error(`Parse failed: ${result.error}`);
-      }
+      // Create parser
+      const parser = await tracer.startActiveSpan('drive.createParser', async (span) => {
+        const parserFactory = new ParserFactory(this.config, this.providerService);
+        const p = await parserFactory.createDocumentParser(user, contentType, {
+          resourceId: fileId,
+        });
+        span.setAttribute('parser.name', p.name);
+        span.end();
+        return p;
+      });
 
-      // Process content: remove null bytes and normalize whitespace
+      // Perform parsing - key performance point
+      const result = await tracer.startActiveSpan(`drive.parse.${parser.name}`, async (span) => {
+        span.setAttributes({ 'parser.name': parser.name, 'file.size': fileBuffer.length });
+        const r = await parser.parse(fileBuffer);
+        if (r.error) {
+          span.setStatus({ code: SpanStatusCode.ERROR, message: r.error });
+          span.end();
+          throw new Error(`Parse failed: ${r.error}`);
+        }
+        span.setAttribute('content.length', r.content?.length || 0);
+        span.end();
+        return r;
+      });
+
+      // Process and store content
       let processedContent = result.content?.replace(/x00/g, '') || '';
       processedContent = this.normalizeWhitespace(processedContent);
 
-      // Truncate content if it exceeds max word limit before storing
-      const maxWords = this.config.get<number>('drive.maxContentWords') || 3000;
-      processedContent = this.truncateContent(processedContent, maxWords);
+      const maxTokens = this.config.get<number>('drive.maxContentTokens') || 25000;
+      const truncateStart = performance.now();
+      const truncatedContent = truncateContent(processedContent, maxTokens);
+      this.logger.info(
+        `[loadOrParseDriveFile] truncateContent after parse: fileId=${fileId}, len=${processedContent.length}, time=${(performance.now() - truncateStart).toFixed(2)}ms`,
+      );
 
-      // Store to OSS
       const contentStorageKey = `drive-parsed/${user.uid}/${fileId}.txt`;
-      await this.internalOss.putObject(contentStorageKey, result.content);
+      await tracer.startActiveSpan('drive.saveToCache', async (span) => {
+        await this.internalOss.putObject(contentStorageKey, truncatedContent);
+        span.setAttribute('content.length', truncatedContent.length);
+        span.end();
+      });
 
-      // Calculate word count
-      const wordCount = readingTime(processedContent).words;
+      const wordCount = readingTime(truncatedContent).words;
 
-      // Save cache record (upsert ensures concurrency safety)
+      // Save cache record
       await this.prisma.driveFileParseCache.upsert({
         where: { fileId },
         create: {
@@ -775,7 +831,7 @@ export class DriveService implements OnModuleInit {
         },
       });
 
-      // If PDF, record page usage to fileParseRecord
+      // If PDF, record page usage
       if (contentType === 'application/pdf' && numPages) {
         await this.prisma.fileParseRecord.create({
           data: {
@@ -789,11 +845,7 @@ export class DriveService implements OnModuleInit {
         });
       }
 
-      this.logger.info(
-        `Successfully parsed and cached file ${fileId}, content length: ${processedContent.length}, word count: ${wordCount}`,
-      );
-
-      return { ...this.toDTO(driveFile), content: processedContent };
+      return { ...this.toDTO(driveFile), content: truncatedContent };
     } catch (error) {
       this.logger.error(
         `Failed to parse drive file ${fileId}: ${JSON.stringify({ message: error.message })}`,
@@ -862,14 +914,39 @@ export class DriveService implements OnModuleInit {
                 chunks.push(chunk);
               }
 
-              const buffer = Buffer.concat(chunks);
+              let buffer = Buffer.concat(chunks);
+
+              // Compress image before converting to base64
+              const maxArea = Number.parseInt(process.env.IMAGE_MAX_AREA) || 600 * 600;
+              const metadata = await sharp(buffer).metadata();
+              const originalWidth = metadata?.width ?? 0;
+              const originalHeight = metadata?.height ?? 0;
+              const isGif = metadata?.format === 'gif';
+
+              // Calculate scaling factor based on max area
+              const originalArea = originalWidth * originalHeight;
+              const scaleFactor = originalArea > maxArea ? Math.sqrt(maxArea / originalArea) : 1;
+
+              // Resize and convert format if needed
+              if (scaleFactor < 1 || !isGif) {
+                const processedBuffer = await sharp(buffer)
+                  .resize({
+                    width: Math.round(originalWidth * scaleFactor),
+                    height: Math.round(originalHeight * scaleFactor),
+                    fit: 'fill',
+                  })
+                  [isGif ? 'toFormat' : 'toFormat'](isGif ? 'gif' : 'webp')
+                  .toBuffer();
+                buffer = Buffer.from(processedBuffer);
+              }
+
               const base64 = buffer.toString('base64');
-              const contentType = file.type ?? 'application/octet-stream';
+              const contentType = isGif ? 'image/gif' : 'image/webp';
 
               return `data:${contentType};base64,${base64}`;
             } catch (error) {
               this.logger.error(
-                `Failed to generate base64 for drive file ${file.fileId}: ${error.stack}`,
+                `Failed to generate compressed base64 for drive file ${file.fileId}: ${error.stack}`,
               );
               return '';
             }
@@ -1403,6 +1480,184 @@ export class DriveService implements OnModuleInit {
       }
       throw error;
     }
+  }
+
+  /**
+   * Unified file access - checks externalOss first (public), then internalOss (private with auth)
+   * This consolidates both public and private file access into a single method.
+   *
+   * Access logic:
+   * 1. First check if file exists in externalOss (public bucket) - no auth required
+   * 2. If not in externalOss, check if user is logged in
+   * 3. If logged in, verify file belongs to user and serve from internalOss
+   * 4. Otherwise return 404
+   */
+  async getUnifiedFileMetadata(
+    fileId: string,
+    user?: User | null,
+  ): Promise<{
+    contentType: string;
+    filename: string;
+    lastModified: Date;
+    isPublic: boolean;
+  }> {
+    const driveFile = await this.prisma.driveFile.findFirst({
+      select: {
+        uid: true,
+        name: true,
+        type: true,
+        storageKey: true,
+        updatedAt: true,
+      },
+      where: { fileId, deletedAt: null },
+    });
+
+    if (!driveFile) {
+      throw new NotFoundException(`Drive file not found: ${fileId}`);
+    }
+
+    const storageKey = driveFile.storageKey ?? '';
+    if (!storageKey) {
+      throw new NotFoundException(`Drive file storage key missing: ${fileId}`);
+    }
+
+    // Step 1: Check if file exists in externalOss (public)
+    let externalObjectInfo: Awaited<ReturnType<typeof this.externalOss.statObject>> | null = null;
+    try {
+      externalObjectInfo = await this.externalOss.statObject(storageKey);
+    } catch (error) {
+      this.logger.debug(`External OSS stat failed for ${storageKey}: ${error.message}`);
+    }
+    if (externalObjectInfo) {
+      const filename = driveFile.name || path.basename(storageKey) || 'file';
+      const contentType =
+        driveFile.type || getSafeMimeType(filename, mime.getType(filename) ?? undefined);
+
+      const dbUpdatedAt = new Date(driveFile.updatedAt);
+      const ossLastModified = externalObjectInfo.lastModified;
+      const lastModified = ossLastModified > dbUpdatedAt ? ossLastModified : dbUpdatedAt;
+
+      return {
+        contentType,
+        filename,
+        lastModified,
+        isPublic: true,
+      };
+    }
+
+    // Step 2: File not in externalOss, check user authentication and ownership
+    if (!user?.uid) {
+      throw new NotFoundException(`Drive file not found: ${fileId}`);
+    }
+
+    if (driveFile.uid !== user.uid) {
+      throw new NotFoundException(`Drive file not found: ${fileId}`);
+    }
+
+    // Step 3: User owns the file, check internalOss
+    const internalObjectInfo = await this.internalOss.statObject(storageKey);
+    if (!internalObjectInfo) {
+      throw new NotFoundException(`Drive file not found in storage: ${fileId}`);
+    }
+
+    const dbUpdatedAt = new Date(driveFile.updatedAt);
+    const ossLastModified = internalObjectInfo.lastModified;
+    const lastModified = ossLastModified > dbUpdatedAt ? ossLastModified : dbUpdatedAt;
+
+    return {
+      contentType: driveFile.type || 'application/octet-stream',
+      filename: driveFile.name,
+      lastModified,
+      isPublic: false,
+    };
+  }
+
+  /**
+   * Unified file stream - checks externalOss first (public), then internalOss (private with auth)
+   */
+  async getUnifiedFileStream(
+    fileId: string,
+    user?: User | null,
+  ): Promise<{
+    data: Buffer;
+    contentType: string;
+    filename: string;
+    lastModified: Date;
+    isPublic: boolean;
+  }> {
+    const driveFile = await this.prisma.driveFile.findFirst({
+      select: {
+        uid: true,
+        canvasId: true,
+        name: true,
+        storageKey: true,
+        type: true,
+        updatedAt: true,
+      },
+      where: { fileId, deletedAt: null },
+    });
+
+    if (!driveFile) {
+      throw new NotFoundException(`Drive file not found: ${fileId}`);
+    }
+
+    const storageKey = driveFile.storageKey ?? '';
+    if (!storageKey) {
+      throw new NotFoundException(`Drive file storage key missing: ${fileId}`);
+    }
+
+    // Step 1: Try to get from externalOss (public)
+    try {
+      const externalReadable = await this.externalOss.getObject(storageKey);
+      if (externalReadable) {
+        const data = await streamToBuffer(externalReadable);
+        const filename = driveFile.name || path.basename(storageKey) || 'file';
+        const contentType =
+          driveFile.type || getSafeMimeType(filename, mime.getType(filename) ?? undefined);
+
+        return {
+          data,
+          contentType,
+          filename,
+          lastModified: new Date(driveFile.updatedAt),
+          isPublic: true,
+        };
+      }
+    } catch (error) {
+      // File not in externalOss, continue to check internalOss
+      if (
+        error?.code !== 'NoSuchKey' &&
+        error?.code !== 'NotFound' &&
+        !error?.message?.includes('The specified key does not exist')
+      ) {
+        this.logger.warn(`Error checking externalOss for ${fileId}: ${error.message}`);
+      }
+    }
+
+    // Step 2: File not in externalOss, check user authentication and ownership
+    if (!user?.uid) {
+      throw new NotFoundException(`Drive file not found: ${fileId}`);
+    }
+
+    if (driveFile.uid !== user.uid) {
+      throw new NotFoundException(`Drive file not found: ${fileId}`);
+    }
+
+    // Step 3: User owns the file, get from internalOss
+    const internalReadable = await this.internalOss.getObject(storageKey);
+    if (!internalReadable) {
+      throw new NotFoundException(`File content not found: ${fileId}`);
+    }
+
+    const data = await streamToBuffer(internalReadable);
+
+    return {
+      data,
+      contentType: driveFile.type || 'application/octet-stream',
+      filename: driveFile.name,
+      lastModified: new Date(driveFile.updatedAt),
+      isPublic: false,
+    };
   }
 
   /**

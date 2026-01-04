@@ -1,7 +1,15 @@
-import { SkillContext } from '@refly/openapi-schema';
-import { encode } from 'gpt-tokenizer';
+import { ActionResult, SkillContext } from '@refly/openapi-schema';
+import { countToken } from '@refly/utils/token';
 import { SkillEngine } from '../../engine';
 import { truncateContent } from './token';
+
+// Regex to match and remove tool_use code blocks from content
+// This prevents the model from seeing and copying these internal XML patterns
+// Matches both markdown code block format and standalone XML tags:
+// 1. ```tool_use\n<tool_use>...</tool_use>\n```
+// 2. <tool_use>...</tool_use> (standalone)
+const TOOL_USE_BLOCK_REGEX = /\n*```tool_use(?:_result)?[^\n]*\n[\s\S]*?```\n*/g;
+const TOOL_USE_TAG_REGEX = /<tool_use[\s\S]*?<\/tool_use>/g;
 
 export interface ContextFile {
   name: string;
@@ -13,11 +21,24 @@ export interface ContextFile {
   variableName?: string;
 }
 
+/**
+ * Metadata-only version of ContextFile (without content)
+ * Used in ContextBlock to reduce token usage - LLM should use read_file to get full content
+ */
+export interface ContextFileMeta {
+  name: string;
+  fileId: string;
+  type: string;
+  summary: string;
+  variableId?: string;
+  variableName?: string;
+}
+
 export interface AgentResult {
   resultId: string;
   title: string;
   content: string;
-  outputFiles: ContextFile[];
+  outputFiles: ContextFileMeta[];
 }
 
 // ============================================================================
@@ -45,7 +66,7 @@ export interface ArchivedRef {
 }
 
 export interface ContextBlock {
-  files: ContextFile[];
+  files: ContextFileMeta[];
   results: AgentResult[];
   totalTokens?: number;
   /**
@@ -59,7 +80,55 @@ export interface ContextBlock {
 // Maximum tokens for a single result/file to prevent one item from consuming too much space
 // Can be overridden via environment variables
 const MAX_SINGLE_RESULT_TOKENS = Number(process.env.MAX_SINGLE_RESULT_TOKENS) || 30000;
-const MAX_SINGLE_FILE_TOKENS = Number(process.env.MAX_SINGLE_FILE_TOKENS) || 20000;
+
+/**
+ * Strip tool_use code blocks from content.
+ *
+ * When previous result content is included in the context, it may contain
+ * ```tool_use ... ``` blocks that were used for frontend rendering.
+ * If the model sees these XML patterns, it may copy them as text output
+ * instead of actually invoking tools. This function removes such blocks.
+ */
+function stripToolUseBlocks(content: string): string {
+  if (!content) return content;
+  // First remove markdown code blocks, then any remaining standalone XML tags
+  return content.replace(TOOL_USE_BLOCK_REGEX, '\n').replace(TOOL_USE_TAG_REGEX, '').trim();
+}
+
+/**
+ * Extract content from ActionResult, preferring messages over steps.
+ *
+ * Priority order:
+ * 1. Messages (action_messages table) - cleanly separated AI and tool messages
+ * 2. Steps (action_steps table) - fallback for backward compatibility
+ *
+ * Using messages avoids XML-formatted tool calls in the context, which prevents
+ * the model from learning incorrect patterns.
+ */
+function extractResultContent(result: ActionResult): string {
+  if (!result) return '';
+
+  // Priority 1: Use messages if available (preferred)
+  if (result.messages && Array.isArray(result.messages) && result.messages.length > 0) {
+    return result.messages
+      .filter((msg: any) => msg?.type === 'ai') // Only include AI messages
+      .map((msg: any) => {
+        // Combine reasoning content and regular content
+        const reasoning = msg?.reasoningContent || '';
+        const content = msg?.content || '';
+        return reasoning ? `${reasoning}\n\n${content}` : content;
+      })
+      .filter(Boolean)
+      .join('\n\n');
+  }
+
+  // Priority 2: Fallback to steps for backward compatibility
+  if (result.steps && Array.isArray(result.steps)) {
+    return result.steps.map((step: any) => step?.content || '').join('\n\n');
+  }
+
+  return '';
+}
 
 /**
  * Prepare context from SkillContext into a structured ContextBlock format
@@ -78,56 +147,32 @@ export async function prepareContext(
   }
 
   const maxTokens = options?.maxTokens ?? 0;
-  const selectedFiles: ContextFile[] = [];
+  const selectedFiles: ContextFileMeta[] = [];
   const selectedResults: AgentResult[] = [];
   let currentTokens = 0;
 
   // Helper function to estimate tokens for content
   const estimateTokens = (content: string): number => {
-    return encode(content ?? '').length;
+    return countToken(content);
   };
 
-  // Process files with token estimation
+  // Process files - only store metadata (no content) to save tokens
+  // LLM should use read_file tool to get full content when needed
   if (context?.files?.length > 0) {
-    // Sort files by content length (shortest first) to prioritize smaller files
-    // This ensures shorter files are less likely to be truncated later
-    const sortedFiles = [...context.files].sort((a, b) => {
-      const aContent = a?.file?.content ?? '';
-      const bContent = b?.file?.content ?? '';
-      return aContent.length - bContent.length;
-    });
-
-    for (const item of sortedFiles) {
+    for (const item of context.files) {
       const file = item?.file;
       if (!file) continue;
 
-      let fileContent = file?.content ?? '';
-      let contentTokens = estimateTokens(fileContent);
-
-      // Truncate single file if it exceeds the limit
-      if (contentTokens > MAX_SINGLE_FILE_TOKENS) {
-        fileContent = truncateContent(fileContent, MAX_SINGLE_FILE_TOKENS);
-        contentTokens = estimateTokens(fileContent);
-      }
-
-      // Check if adding this file would exceed token limit
-      if (maxTokens > 0 && currentTokens + contentTokens > maxTokens) {
-        // If we can't add the full file, skip it
-        continue;
-      }
-
-      const contextFile: ContextFile = {
+      const contextFile: ContextFileMeta = {
         name: file?.name ?? 'Untitled File',
         fileId: file?.fileId ?? 'unknown',
         type: file?.type ?? 'unknown',
         summary: file?.summary ?? '',
-        content: fileContent,
         ...(item.variableId && { variableId: item.variableId }),
         ...(item.variableName && { variableName: item.variableName }),
       };
 
       selectedFiles.push(contextFile);
-      currentTokens += contentTokens;
     }
   }
 
@@ -136,8 +181,9 @@ export async function prepareContext(
     // Sort results by content length (shortest first) to prioritize smaller results
     // This ensures shorter results are less likely to be truncated later
     const sortedResults = [...context.results].sort((a, b) => {
-      const aContent = a?.result?.steps?.map((step) => step.content).join('\n\n') ?? '';
-      const bContent = b?.result?.steps?.map((step) => step.content).join('\n\n') ?? '';
+      // Prefer using messages for content estimation if available
+      const aContent = extractResultContent(a?.result);
+      const bContent = extractResultContent(b?.result);
       return aContent.length - bContent.length;
     });
 
@@ -145,7 +191,10 @@ export async function prepareContext(
       const result = item?.result;
       if (!result) continue;
 
-      let resultContent = result?.steps?.map((step) => step.content).join('\n\n') ?? '';
+      // Extract content from result, preferring messages over steps
+      // Messages provide cleaner separation between AI responses and tool calls
+      let resultContent = extractResultContent(result);
+      resultContent = stripToolUseBlocks(resultContent);
       let contentTokens = estimateTokens(resultContent);
 
       // Truncate single result if it exceeds the limit
@@ -162,15 +211,16 @@ export async function prepareContext(
 
       const agentResult: AgentResult = {
         resultId: result?.resultId ?? 'unknown',
-        title: result?.title ?? 'Untitled Result',
+        title: result?.title ?? 'Untitled Agent',
         content: resultContent,
+        // outputFiles only contain metadata (no content) to save tokens
+        // LLM should use read_file tool to get full content when needed
         outputFiles:
           result?.files?.map((file) => ({
             name: file?.name ?? 'Untitled File',
             fileId: file?.fileId ?? 'unknown',
             type: file?.type ?? 'unknown',
             summary: file?.summary ?? '',
-            content: file?.content ?? '',
           })) ?? [],
       };
 

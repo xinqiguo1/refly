@@ -45,7 +45,13 @@ export const ImportResourceModal = memo(() => {
   const [currentProjectId, setCurrentProjectId] = useState<string | undefined>(projectId);
 
   const disableSave = useMemo(() => {
-    return saveLoading || waitingList.length === 0 || waitingList.length > canImportCount;
+    const hasUploadingFiles = waitingList.some((item) => item.file?.status === 'uploading');
+    return (
+      saveLoading ||
+      waitingList.length === 0 ||
+      waitingList.length > canImportCount ||
+      hasUploadingFiles
+    );
   }, [waitingList, canImportCount, saveLoading]);
 
   useEffect(() => {
@@ -90,7 +96,7 @@ export const ImportResourceModal = memo(() => {
       refetchUsage();
       refetchDriveFiles();
 
-      message.success(t('common.putSuccess'));
+      message.success(t('common.upload.notification.allUploaded'));
 
       const mediaFiles = waitingList.filter(
         (item) =>

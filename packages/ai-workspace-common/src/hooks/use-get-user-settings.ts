@@ -12,6 +12,8 @@ import { UserSettings } from '@refly/openapi-schema';
 import { UID_COOKIE } from '@refly/utils/cookie';
 import { isPublicAccessPageByPath } from '@refly-packages/ai-workspace-common/hooks/use-is-share-page';
 import { isDesktop } from '@refly/ui-kit';
+import { updateUserProperties } from '@refly/telemetry-web';
+import { authChannel } from '@refly-packages/ai-workspace-common/utils/auth-channel';
 
 export const useGetUserSettings = () => {
   const userStore = useUserStoreShallow((state) => ({
@@ -77,9 +79,11 @@ export const useGetUserSettings = () => {
     const subscriptionLookupKey = settings?.subscription?.lookupKey;
 
     const { setPlanType, setUserType } = useSubscriptionStore.getState();
+    let userTypeForUserProperties: string | null = null;
     if (!subscriptionPlanType) {
       setPlanType('free');
       setUserType('Free');
+      userTypeForUserProperties = 'Free';
     }
     if (subscriptionPlanType) {
       setPlanType(subscriptionPlanType);
@@ -101,10 +105,22 @@ export const useGetUserSettings = () => {
         userType = 'Pro_old';
       }
       setUserType(userType);
+      userTypeForUserProperties = userType;
+    }
+
+    if (userTypeForUserProperties) {
+      updateUserProperties({ user_plan: userTypeForUserProperties });
     }
 
     localStorage.setItem('refly-user-profile', safeStringifyJSON(settings));
     userStore.setIsLogin(true);
+
+    // Update authChannel current uid and broadcast login event
+    const currentUid = settings?.uid;
+    if (currentUid) {
+      authChannel.updateCurrentUid(currentUid);
+      authChannel.broadcast({ type: 'login', uid: currentUid });
+    }
 
     // Check if user has been invited to show invitation code modal
     try {

@@ -2,9 +2,16 @@ import { Injectable, Optional } from '@nestjs/common';
 import { PinoLogger } from 'nestjs-pino';
 import { randomUUID } from 'node:crypto';
 import { DirectConnection } from '@hocuspocus/server';
-import { AIMessage, HumanMessage } from '@langchain/core/messages';
-import { AIMessageChunk, BaseMessage, MessageContentComplex } from '@langchain/core/messages';
-import { FilteredLangfuseCallbackHandler } from '@refly/observability';
+import {
+  AIMessage,
+  AIMessageChunk,
+  BaseMessage,
+  HumanMessage,
+  MessageContentComplex,
+  ToolMessage,
+} from '@langchain/core/messages';
+import { FilteredLangfuseCallbackHandler, Trace, getTracer } from '@refly/observability';
+import { propagation, context, SpanStatusCode } from '@opentelemetry/api';
 import { InjectQueue } from '@nestjs/bullmq';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -13,8 +20,8 @@ import {
   WorkflowExecutionNotFoundError,
 } from '@refly/errors';
 import {
+  ActionMessage,
   ActionResult,
-  ActionStep,
   Artifact,
   DriveFile,
   LLMModelConfig,
@@ -37,7 +44,7 @@ import { Queue } from 'bullmq';
 import { Response } from 'express';
 import { EventEmitter } from 'node:events';
 import * as Y from 'yjs';
-import { encode } from 'gpt-tokenizer';
+import { countToken } from '@refly/utils/token';
 import {
   QUEUE_AUTO_NAME_CANVAS,
   QUEUE_SYNC_PILOT_STEP,
@@ -67,6 +74,7 @@ import { InvokeSkillJobData } from './skill.dto';
 import { DriveService } from '../drive/drive.service';
 import { CanvasSyncService } from '../canvas-sync/canvas-sync.service';
 import { normalizeCreditBilling } from '../../utils/credit-billing';
+import { SkillInvokeMetrics } from './skill-invoke.metrics';
 
 @Injectable()
 export class SkillInvokerService {
@@ -90,6 +98,7 @@ export class SkillInvokerService {
     private readonly stepService: StepService,
     private readonly creditService: CreditService,
     private readonly canvasSyncService: CanvasSyncService,
+    private readonly metrics: SkillInvokeMetrics,
     @Optional()
     @InjectQueue(QUEUE_SYNC_REQUEST_USAGE)
     private requestUsageQueue?: Queue<SyncRequestUsageJobData>,
@@ -113,7 +122,6 @@ export class SkillInvokerService {
     user: User,
     providerItem: ProviderItem,
     result: ActionResult,
-    steps: ActionStep[],
   ): Promise<BaseMessage[]> {
     const query = result.input?.query || result.title;
 
@@ -127,12 +135,22 @@ export class SkillInvokerService {
       ];
     }
 
-    // Build consolidated tool call history by step from DB to avoid duplicating start/stream/end fragments
+    // Check if result already has messages (from populateSkillResultHistory)
+    if (result.messages && result.messages.length > 0) {
+      // Build messages from pre-fetched action_messages (preferred approach)
+      return [
+        new HumanMessage({ content: messageContent } as any),
+        ...this.reconstructLangchainMessagesFromDB(result.messages),
+      ];
+    }
+
+    // Final fallback: Build from steps if no messages found (backward compatibility)
     const toolCallsByStep = await this.toolCallService.fetchConsolidatedToolUseOutputByStep(
       result.resultId,
       result.version,
     );
 
+    const steps = result.steps;
     const aiMessages =
       steps?.length > 0
         ? steps.map((step) => {
@@ -157,6 +175,81 @@ export class SkillInvokerService {
     return [new HumanMessage({ content: messageContent } as any), ...aiMessages];
   }
 
+  /**
+   * Reconstruct LangChain messages from action_messages table records
+   * This ensures AI messages and Tool messages are properly separated without XML formatting
+   */
+  private reconstructLangchainMessagesFromDB(messages: ActionMessage[]): BaseMessage[] {
+    const langchainMessages: BaseMessage[] = [];
+
+    for (const msg of messages) {
+      const messageType = msg.type;
+      const content = msg.content ?? '';
+      const reasoningContent = msg.reasoningContent ?? '';
+
+      if (messageType === 'ai') {
+        // Reconstruct AI message with pure content (no XML tool use formatting)
+        const mergedContent = getWholeParsedContent(reasoningContent, content);
+        const metadata = msg.toolCallMeta ?? {};
+
+        langchainMessages.push(
+          new AIMessage({
+            content: mergedContent,
+            additional_kwargs: metadata,
+          }),
+        );
+      } else if (messageType === 'tool') {
+        // Reconstruct tool use + tool result in the canonical LangChain format.
+        // Bedrock (Converse) requires toolResult blocks to match toolUse blocks from the previous assistant turn.
+        const toolCallMeta = (msg.toolCallMeta ?? {}) as ToolCallMeta;
+        const toolCallResult = msg.toolCallResult ?? {};
+
+        const toolCallId = toolCallMeta?.toolCallId ?? msg.toolCallId ?? '';
+        const toolName = toolCallMeta?.toolName ?? (msg.toolCallResult as any)?.toolName ?? '';
+
+        // Ensure we never emit a ToolMessage (toolResult) without a matching tool call (toolUse).
+        if (!toolCallId || !toolName) {
+          langchainMessages.push(
+            new AIMessage({
+              content: JSON.stringify((toolCallResult as any)?.output ?? toolCallResult),
+            }),
+          );
+          continue;
+        }
+
+        const rawArgs = (toolCallResult as any)?.input;
+        const toolArgs =
+          rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : {};
+
+        // 1) Tool use: assistant message with tool_calls
+        langchainMessages.push(
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              {
+                id: toolCallId,
+                name: toolName,
+                args: toolArgs,
+              },
+            ],
+          }),
+        );
+
+        // 2) Tool result: ToolMessage that references the tool_call_id
+        langchainMessages.push(
+          new ToolMessage({
+            content: JSON.stringify((toolCallResult as any)?.output ?? toolCallResult),
+            tool_call_id: toolCallId,
+            name: toolName,
+          }),
+        );
+      }
+    }
+
+    return langchainMessages;
+  }
+
+  @Trace('skill.buildInvokeConfig')
   private async buildInvokeConfig(
     user: User,
     data: InvokeSkillJobData & {
@@ -175,10 +268,52 @@ export class SkillInvokerService {
       eventListener,
       toolsets,
     } = data;
-    const userPo = await this.prisma.user.findUnique({
-      select: { uiLocale: true, outputLocale: true },
-      where: { uid: user.uid },
-    });
+
+    // Collect fileIds that need to be fetched
+    const fileIdsToFetch =
+      context?.files?.filter((f) => f.fileId && !f.file).map((f) => f.fileId) ?? [];
+
+    // Parallel fetch: user preferences and drive files
+    const [userPo, driveFiles] = await Promise.all([
+      this.prisma.user.findUnique({
+        select: { uiLocale: true, outputLocale: true },
+        where: { uid: user.uid },
+      }),
+      fileIdsToFetch.length > 0
+        ? this.prisma.driveFile.findMany({
+            where: {
+              fileId: { in: fileIdsToFetch },
+              deletedAt: null,
+            },
+            select: {
+              fileId: true,
+              name: true,
+              type: true,
+              summary: true,
+              category: true,
+            },
+          })
+        : Promise.resolve([]),
+    ]);
+
+    // Populate empty file objects in context.files
+    if (driveFiles.length > 0 && context?.files) {
+      const fileMap = new Map(driveFiles.map((f) => [f.fileId, f]));
+      for (const fileItem of context.files) {
+        if (fileItem.fileId && !fileItem.file) {
+          const driveFile = fileMap.get(fileItem.fileId);
+          if (driveFile) {
+            fileItem.file = {
+              fileId: driveFile.fileId,
+              name: driveFile.name,
+              type: driveFile.type,
+              summary: driveFile.summary,
+              category: driveFile.category,
+            } as DriveFile;
+          }
+        }
+      }
+    }
 
     const outputLocale = data?.locale || userPo?.outputLocale;
     // Merge the current context with contexts from result history
@@ -201,6 +336,10 @@ export class SkillInvokerService {
       },
     };
 
+    if (data.copilotSessionId) {
+      config.configurable.copilotSessionId = data.copilotSessionId;
+    }
+
     // Add project info if projectId is provided
     if (projectId) {
       const project = await this.prisma.project.findUnique({
@@ -214,7 +353,7 @@ export class SkillInvokerService {
 
     if (resultHistory?.length > 0) {
       config.configurable.chatHistory = await Promise.all(
-        resultHistory.map((r) => this.buildLangchainMessages(user, providerItem, r, r.steps)),
+        resultHistory.map((r) => this.buildLangchainMessages(user, providerItem, r)),
       ).then((messages) => messages.flat());
     }
 
@@ -262,9 +401,16 @@ export class SkillInvokerService {
     // Categorize errors more reliably
     const isTimeoutError =
       err instanceof Error && (err.name === 'TimeoutError' || /timeout/i.test(err.message));
+    // Only classify as abort error if:
+    // 1. The error name is 'AbortError' (standard abort signal error)
+    // 2. OR the message specifically indicates a user-initiated abort (not just containing "abort")
+    // This prevents model errors like ValidationException from being misclassified
     const isAbortError =
       err instanceof Error &&
-      (err.name === 'AbortError' || /abort/i.test(err.message)) &&
+      (err.name === 'AbortError' ||
+        /^aborted by user$/i.test(err.message) ||
+        /^action was aborted/i.test(err.message) ||
+        /^workflow aborted by user$/i.test(err.message)) &&
       !isCreditError;
     const isNetworkError =
       err instanceof Error && (err.name === 'NetworkError' || /network|fetch/i.test(err.message));
@@ -337,14 +483,60 @@ export class SkillInvokerService {
   }
 
   private async _invokeSkill(user: User, data: InvokeSkillJobData, res?: Response) {
-    const { input, result, context } = data;
+    // Restore parent context from queue (cross-pod) or use current context (direct call)
+    const parentCtx = data.traceCarrier
+      ? propagation.extract(context.active(), data.traceCarrier)
+      : context.active();
+
+    const tracer = getTracer();
+    return tracer.startActiveSpan(
+      'skill.invoke',
+      { attributes: { 'skill.fromQueue': !!data.traceCarrier } },
+      parentCtx,
+      async (span) => {
+        try {
+          const result = await this._invokeSkillInner(user, data, res, span);
+          span.setStatus({ code: SpanStatusCode.OK });
+          return result;
+        } catch (error) {
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          span.recordException(error as Error);
+          throw error;
+        } finally {
+          span.end();
+        }
+      },
+    );
+  }
+
+  private async _invokeSkillInner(
+    user: User,
+    data: InvokeSkillJobData,
+    res: Response | undefined,
+    span: import('@opentelemetry/api').Span,
+  ) {
+    const { input, result, context: ctx } = data;
     const { resultId, version, actionMeta, tier } = result;
+    const canvasId = data.target?.entityType === 'canvas' ? data.target?.entityId : undefined;
+
+    // Set searchable attributes on span
+    span.setAttributes({
+      'skill.resultId': resultId,
+      'skill.name': data.skillName || 'unknown',
+      'skill.version': version,
+      'canvas.id': canvasId,
+      'user.uid': user.uid,
+    });
+
     this.logger.info(
       `invoke skill with input: ${JSON.stringify(input)}, resultId: ${resultId}, version: ${version}`,
     );
 
     const imageFiles: DriveFile[] =
-      context?.files
+      ctx?.files
         ?.filter((item) => item.file?.category === 'image' || item.file?.type.startsWith('image/'))
         ?.map((item) => item.file) ?? [];
     const hasVisionCapability =
@@ -373,7 +565,6 @@ export class SkillInvokerService {
     }
 
     // Archive files from previous execution of this result
-    const canvasId = data.target?.entityType === 'canvas' ? data.target?.entityId : undefined;
     if (canvasId) {
       this.logger.info(
         { resultId, canvasId, uid: user.uid, source: 'agent' },
@@ -647,8 +838,8 @@ export class SkillInvokerService {
     }
 
     // Track latest tool call metadata for error handling
-    let lastStepName: string | undefined;
-    let lastToolCallMeta: ToolCallMeta | undefined;
+    let _lastStepName: string | undefined;
+    let _lastToolCallMeta: ToolCallMeta | undefined;
 
     try {
       // Check if already aborted before starting execution (handles queued aborts)
@@ -665,6 +856,10 @@ export class SkillInvokerService {
       const startTs = Date.now();
       const toolCallIds: Set<string> = new Set();
       const toolCallStartTimes: Map<string, number> = new Map();
+      const llmCallStartTimes: Map<string, number> = new Map();
+
+      // Track Vertex AI cache tokens from custom events (workaround for LangChain not extracting cachedContentTokenCount)
+      const vertexCacheTokens: Map<string, number> = new Map();
 
       for await (const event of skill.streamEvents(input, {
         ...config,
@@ -680,6 +875,22 @@ export class SkillInvokerService {
         lastOutputTime = Date.now();
         hasAnyOutput = true;
         switch (event.event) {
+          case 'on_custom_event': {
+            // Extract Vertex AI cache tokens from google-chunk custom events
+            // This is a workaround for LangChain not extracting cachedContentTokenCount
+            const customEventName = event.name;
+            if (customEventName?.includes('google-chunk')) {
+              const customData = (event as any).data;
+              const output = customData?.output;
+              const cachedTokenCount = output?.usageMetadata?.cachedContentTokenCount;
+
+              // Store the cached token count if it exists and is positive
+              if (cachedTokenCount && cachedTokenCount > 0 && event.run_id) {
+                vertexCacheTokens.set(event.run_id, cachedTokenCount);
+              }
+            }
+            break;
+          }
           case 'on_tool_end':
           case 'on_tool_error':
           case 'on_tool_start': {
@@ -736,8 +947,8 @@ export class SkillInvokerService {
                 const toolStartTs = Date.now();
 
                 // Track for error handling
-                lastStepName = stepName;
-                lastToolCallMeta = {
+                _lastStepName = stepName;
+                _lastToolCallMeta = {
                   toolName,
                   toolsetKey,
                   toolsetId,
@@ -848,6 +1059,14 @@ export class SkillInvokerService {
                 runId,
               });
               toolCallIds.delete(toolCallId);
+
+              // Record tool invocation metrics
+              if (toolStartTs) {
+                this.metrics.tool.duration(toolName, toolsetKey, Date.now() - toolStartTs);
+                toolCallStartTimes.delete(toolCallId);
+              }
+              this.metrics.tool.fail({ toolName, toolsetKey, error: errorMsg });
+
               break;
             }
             if (event.event === 'on_tool_end') {
@@ -931,6 +1150,19 @@ export class SkillInvokerService {
                 runId,
               });
               toolCallIds.delete(toolCallId);
+
+              // Record tool invocation metrics
+              if (toolStartTs) {
+                this.metrics.tool.duration(toolName, toolsetKey, Date.now() - toolStartTs);
+                toolCallStartTimes.delete(toolCallId);
+              }
+
+              if (isErrorStatus) {
+                this.metrics.tool.fail({ toolName, toolsetKey, error: errorMessage || '' });
+              } else {
+                this.metrics.tool.success({ toolName, toolsetKey });
+              }
+
               break;
             }
             break;
@@ -959,6 +1191,13 @@ export class SkillInvokerService {
                   messageId: messageAggregator.getCurrentAIMessageId(),
                 });
               }
+            }
+            break;
+          }
+          case 'on_chat_model_start': {
+            const runId = event.run_id;
+            if (runId) {
+              llmCallStartTimes.set(runId, Date.now());
             }
             break;
           }
@@ -991,12 +1230,32 @@ export class SkillInvokerService {
               //   - cacheReadInputTokens (plural, with 's')
               //   - cacheReadInputTokensCount (legacy)
               // Anthropic (via LangChain) uses: input_token_details.cache_read
+              // Vertex AI: Note that @langchain/google-vertexai v2.1.2 does NOT extract
+              //   cachedContentTokenCount from Vertex AI responses.
               const bedrockUsage = responseMetadata?.metadata?.usage;
 
-              const inputTokens = usageMetadata?.input_tokens ?? 0;
-              const outputTokens = usageMetadata?.output_tokens ?? 0;
+              // Extract Vertex AI cached tokens from our workaround storage
+              // Important: Keep as undefined if not found, so ?? operator can fall through to Bedrock fields
+              const vertexCachedTokens = event.run_id
+                ? vertexCacheTokens.get(event.run_id)
+                : undefined;
+
+              const rawInputTokens = usageMetadata?.input_tokens ?? 0;
+              const rawOutputTokens = usageMetadata?.output_tokens ?? 0;
+
+              // For Vertex AI: promptTokenCount includes cached tokens
+              // So we need to subtract cache tokens to get the actual new input tokens
+              // Vertex AI semantics: promptTokenCount = cachedContentTokenCount + new input
+              // Our semantics (Bedrock-like): inputTokens = new input only, cacheReadTokens = cached
+              const inputTokens = vertexCachedTokens
+                ? rawInputTokens - vertexCachedTokens
+                : rawInputTokens;
+
+              const outputTokens = rawOutputTokens;
+
               const cacheReadTokens =
                 usageMetadata?.input_token_details?.cache_read ??
+                vertexCachedTokens ??
                 bedrockUsage?.cacheReadInputTokenCount ??
                 bedrockUsage?.cacheReadInputTokens ??
                 bedrockUsage?.cacheReadInputTokensCount ??
@@ -1007,6 +1266,11 @@ export class SkillInvokerService {
                 bedrockUsage?.cacheWriteInputTokens ??
                 bedrockUsage?.cacheWriteInputTokensCount ??
                 0;
+
+              // Clean up the cached token count after using it
+              if (event.run_id && vertexCachedTokens && vertexCachedTokens > 0) {
+                vertexCacheTokens.delete(event.run_id);
+              }
 
               // According to AWS Bedrock semantics (https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-token-burndown.html):
               // - InputTokenCount: tokens that need to be processed by the model (billable at full rate)
@@ -1035,6 +1299,26 @@ export class SkillInvokerService {
               }
 
               resultAggregator.addUsageItem(runMeta, usage);
+
+              // Record OpenTelemetry metrics: LLM invocation
+              const modelName = String(runMeta.ls_model_name);
+              const runId = event.run_id;
+              if (runId) {
+                const startTime = llmCallStartTimes.get(runId);
+                if (startTime) {
+                  this.metrics.llm.duration(modelName, Date.now() - startTime);
+                  llmCallStartTimes.delete(runId);
+                }
+              }
+
+              this.metrics.llm.success(modelName);
+              this.metrics.llm.token({
+                inputTokens,
+                outputTokens,
+                cacheReadTokens,
+                cacheWriteTokens,
+                modelName,
+              });
 
               // Get the current AI message ID before finalizing
               const aiMessageId = messageAggregator.getCurrentAIMessageId();
@@ -1073,6 +1357,9 @@ export class SkillInvokerService {
         }
       }
     } catch (err) {
+      // Record OpenTelemetry metrics: LLM invocation error
+      this.metrics.llm.fail(String(runMeta?.ls_model_name || 'unknown'));
+
       const errorInfo = this.categorizeError(err);
       const errorMessage = err.message || 'Unknown error';
       const errorType = err.name || 'Error';
@@ -1108,61 +1395,44 @@ export class SkillInvokerService {
         }
       }
 
-      const isTokenLimitError = this.isTokenLimitError(err);
-      const shouldHandleErrorFallback = !errorInfo.isAbortError;
-      const failureReason = isTokenLimitError
-        ? 'token_limit_exceeded'
-        : errorInfo.isNetworkError
-          ? 'network_error'
-          : 'execution_error';
-      const failureMessage = isTokenLimitError
-        ? 'Token limit exceeded. Tool execution results have been saved to file.'
-        : `${errorInfo.userFriendlyMessage}. Tool execution results have been saved to file.`;
+      // const isTokenLimitError = this.isTokenLimitError(err);
+      // const shouldHandleErrorFallback = !errorInfo.isAbortError;
+      // const failureReason = isTokenLimitError
+      //   ? 'token_limit_exceeded'
+      //   : errorInfo.isNetworkError
+      //     ? 'network_error'
+      //     : 'execution_error';
+      // const failureMessage = isTokenLimitError
+      //   ? 'Token limit exceeded. Tool execution results have been saved to file.'
+      //   : `${errorInfo.userFriendlyMessage}. Tool execution results have been saved to file.`;
 
-      const fallbackHandled = shouldHandleErrorFallback
-        ? await this.handleErrorFallback({
-            input,
-            config,
-            user,
-            resultId,
-            version,
-            canvasId,
-            res,
-            runMeta,
-            providerItem: data.providerItem,
-            toolCallMeta: lastToolCallMeta,
-            stepName: lastStepName ?? runMeta?.step?.name,
-            failureReason,
-            failureMessage,
-          })
-        : null;
+      // const fallbackHandled = shouldHandleErrorFallback
+      //   ? await this.handleErrorFallback({
+      //       input,
+      //       config,
+      //       user,
+      //       resultId,
+      //       version,
+      //       canvasId,
+      //       res,
+      //       runMeta,
+      //       providerItem: data.providerItem,
+      //       toolCallMeta: lastToolCallMeta,
+      //       stepName: lastStepName ?? runMeta?.step?.name,
+      //       failureReason,
+      //       failureMessage,
+      //     })
+      //   : null;
 
-      if (fallbackHandled) {
-        // If fallback was successfully handled, add message to step content for persistence
-        const errorRecoveryMessage = `\n\nTool execution failed. Results have been saved to ${fallbackHandled.internalUrl}. Please retry in a new node based on the final results.\n\n`;
-        // Add to step content for persistence
-        resultAggregator.handleStreamContent(runMeta, errorRecoveryMessage);
-        if (res) {
-          // Send as stream content, not error - so frontend renders it normally (no popup)
-          writeSSEResponse(res, {
-            event: 'stream',
-            resultId,
-            version,
-            content: errorRecoveryMessage,
-            step: runMeta?.step,
-          });
-        }
-      } else {
-        // Normal error handling - send error SSE (triggers popup) and set failed status
-        if (res) {
-          writeSSEResponse(res, {
-            event: 'error',
-            resultId,
-            version,
-            error: genBaseRespDataFromError(new Error(errorInfo.userFriendlyMessage)),
-            originError: err.message,
-          });
-        }
+      // Normal error handling - send error SSE (triggers popup) and set failed status
+      if (res) {
+        writeSSEResponse(res, {
+          event: 'error',
+          resultId,
+          version,
+          error: genBaseRespDataFromError(new Error(errorInfo.userFriendlyMessage)),
+          originError: err.message,
+        });
       }
       if (errorInfo.isAbortError) {
         result.status = 'failed';
@@ -1497,8 +1767,8 @@ export class SkillInvokerService {
         return;
       }
 
-      const inputTokens = encode(input.query || '').length;
-      const outputTokens = encode(generatedContent).length;
+      const inputTokens = countToken(input.query || '');
+      const outputTokens = countToken(generatedContent);
       const cacheReadTokens = 0;
       const cacheWriteTokens = 0;
 
@@ -1788,10 +2058,10 @@ export class SkillInvokerService {
         `Failed to use LangChain tokenizer, falling back to basic estimation: ${error instanceof Error ? error.message : error}`,
       );
 
-      const inputTokens = encode(JSON.stringify(input)).length;
-      const contextTokens = encode(JSON.stringify(config.configurable.context || {})).length;
-      const historyTokens = encode(JSON.stringify(config.configurable.chatHistory || [])).length;
-      const toolsTokens = encode(JSON.stringify(config.configurable.selectedTools || [])).length;
+      const inputTokens = countToken(JSON.stringify(input));
+      const contextTokens = countToken(JSON.stringify(config.configurable.context || {}));
+      const historyTokens = countToken(JSON.stringify(config.configurable.chatHistory || []));
+      const toolsTokens = countToken(JSON.stringify(config.configurable.selectedTools || []));
       const totalTokens = inputTokens + contextTokens + historyTokens + toolsTokens;
 
       return {

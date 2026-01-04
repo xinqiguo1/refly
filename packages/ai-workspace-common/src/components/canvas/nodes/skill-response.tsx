@@ -29,7 +29,6 @@ import {
 } from '@refly-packages/ai-workspace-common/hooks/canvas';
 import { useActionPolling } from '@refly-packages/ai-workspace-common/hooks/canvas/use-action-polling';
 import { useGetNodeConnectFromDragCreateInfo } from '@refly-packages/ai-workspace-common/hooks/canvas/use-get-node-connect';
-import { useSelectedNodeZIndex } from '@refly-packages/ai-workspace-common/hooks/canvas/use-selected-node-zIndex';
 import { usePilotRecovery } from '@refly-packages/ai-workspace-common/hooks/pilot/use-pilot-recovery';
 import {
   useGetCreditBalance,
@@ -240,7 +239,6 @@ export const SkillResponseNode = memo(
         (connection?.toNode?.id === id || isHovered),
       [connection, id, isHovered],
     );
-    useSelectedNodeZIndex(id, selected);
 
     const { setNodeData, setNodeStyle } = useNodeData();
     const { getEdges, setEdges } = useReactFlow();
@@ -250,13 +248,13 @@ export const SkillResponseNode = memo(
     // Handle node hover events
     const handleMouseEnter = useCallback(() => {
       setIsHovered(true);
-      onHoverStart();
-    }, [onHoverStart]);
+      onHoverStart(selected);
+    }, [onHoverStart, selected]);
 
     const handleMouseLeave = useCallback(() => {
       setIsHovered(false);
-      onHoverEnd();
-    }, [onHoverEnd]);
+      onHoverEnd(selected);
+    }, [onHoverEnd, selected]);
 
     // Get current pilot session info
     const activeSessionId = usePilotStoreShallow(
@@ -320,6 +318,7 @@ export const SkillResponseNode = memo(
         nodeId: id,
         entityId: data.entityId,
         canvasId,
+        query: data?.metadata?.query,
       });
 
     // Sync node status with action result status
@@ -371,6 +370,9 @@ export const SkillResponseNode = memo(
     });
 
     useEffect(() => {
+      // Don't start polling in readonly mode (e.g., run-detail page)
+      if (readonly) return;
+
       if (!isStreaming) {
         if (['executing', 'waiting'].includes(status) && !shareId) {
           // Reset failed state and start polling for new execution
@@ -403,6 +405,7 @@ export const SkillResponseNode = memo(
       shareId,
       version,
       removeStreamResult,
+      readonly,
     ]);
 
     // Listen to pilot step status changes and sync with node status
@@ -485,7 +488,8 @@ export const SkillResponseNode = memo(
         resetFailedState(entityId);
       }
 
-      const nextVersion = (data?.metadata?.version || 0) + 1;
+      const nextVersion =
+        data?.metadata?.status === 'init' ? 0 : (data?.metadata?.version ?? 0) + 1;
 
       setNodeData(id, {
         contentPreview: '',
@@ -770,10 +774,11 @@ export const SkillResponseNode = memo(
                     readonly={readonly}
                     nodeIsExecuting={isExecuting}
                     workflowIsRunning={workflowIsRunning}
-                    onRerunSingle={handleRerunSingle}
+                    onRerun={handleRerunSingle}
                     onRerunFromHere={handleRerunFromHere}
                     onStop={handleStop}
                     status={status}
+                    nodeId={id}
                   />
                 ) : null
               }

@@ -49,7 +49,11 @@ enum PlanPriorityMap {
 // Voucher discount tag - orange style
 const VoucherTag = memo(
   ({ discountPercent, validDays }: { discountPercent: number; validDays: number }) => {
-    const { t } = useTranslation('ui');
+    const { t, i18n } = useTranslation('ui');
+    const isZh = i18n.language?.startsWith('zh');
+    // Convert discountPercent (e.g., 60 = 60% off) to Chinese format (e.g., 4折)
+    const voucherValue = Math.round((100 - discountPercent) / 10);
+
     return (
       <div className="flex items-center gap-1.5 bg-[#FC8800] text-[#FEF2CF] px-3 py-1.5 rounded text-sm font-medium">
         <svg className="w-4 h-4" viewBox="0 0 16 16" fill="none">
@@ -61,9 +65,7 @@ const VoucherTag = memo(
             strokeLinejoin="round"
           />
         </svg>
-        <span>
-          {discountPercent}% {t('voucher.off', 'OFF')}
-        </span>
+        <span>{isZh ? `${voucherValue}折` : `${discountPercent}% ${t('voucher.off', 'OFF')}`}</span>
         <span className="text-white/40 mx-0.5">|</span>
         <span>{t('voucher.validForDays', 'Valid for {{days}} days', { days: validDays })}</span>
       </div>
@@ -419,7 +421,7 @@ const PlanItem = memo((props: PlanItemProps) => {
             </Tag>
           )}
         </div>
-        {voucher && !isCurrentPlan && voucherValidDays && (
+        {voucher && !isCurrentPlan && voucherValidDays && interval !== 'yearly' && (
           <VoucherTag discountPercent={voucher.discountPercent} validDays={voucherValidDays} />
         )}
       </div>
@@ -497,10 +499,10 @@ const PlanItem = memo((props: PlanItemProps) => {
 
 PlanItem.displayName = 'PlanItem';
 
-export const PriceContent = memo((props: { source: PriceSource }) => {
+export const PriceContent = memo((props: { source: PriceSource; entryPoint?: string }) => {
   const { t } = useTranslation('ui');
   const navigate = useNavigate();
-  const { source } = props;
+  const { source, entryPoint } = props;
   const {
     setSubscribeModalVisible: setVisible,
     availableVoucher,
@@ -614,26 +616,23 @@ export const PriceContent = memo((props: { source: PriceSource }) => {
           planType: SubscriptionPlanType;
           interval: SubscriptionInterval;
           voucherId?: string;
+          voucherEntryPoint?: string;
+          voucherUserType?: string;
         } = {
           planType,
           interval: interval,
         };
 
-        // Validate voucher before creating checkout session
-        if (availableVoucher?.voucherId) {
+        // Validate voucher before creating checkout session (only for monthly subscriptions)
+        if (availableVoucher?.voucherId && interval !== 'yearly') {
           const validateRes = await getClient().validateVoucher({
             body: { voucherId: availableVoucher.voucherId },
           });
 
           if (validateRes.data?.data?.valid) {
             body.voucherId = availableVoucher.voucherId;
-
-            // Log voucher applied event
-            logEvent('voucher_applied', null, {
-              voucher_value: Math.round((100 - availableVoucher.discountPercent) / 10),
-              entry_point: 'pricing_page',
-              user_type: userType,
-            });
+            body.voucherEntryPoint = entryPoint || 'pricing_page';
+            body.voucherUserType = userType;
           } else {
             // Voucher is invalid - show message and clear it
             const reason = validateRes.data?.data?.reason || 'Voucher is no longer valid';

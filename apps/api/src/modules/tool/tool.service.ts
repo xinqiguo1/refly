@@ -6,6 +6,8 @@ import {
   BuiltinToolset,
   BuiltinToolsetDefinition,
   GenerateWorkflow,
+  PatchWorkflow,
+  GetWorkflowSummary,
   builtinToolsetInventory,
   toolsetInventory,
 } from '@refly/agent-tools';
@@ -78,9 +80,17 @@ export class ToolService {
     return key === 'web_search';
   }
 
-  private shouldExposeToolset(key?: string): boolean {
+  /**
+   * Check if a toolset should be exposed to users in mentionList.
+   * Filters out deprecated and internal (system-level) toolsets.
+   * Internal toolsets are auto-included by the system and not user-selectable.
+   */
+  private shouldExposeToolset(key?: string, options?: { internal?: boolean }): boolean {
     if (!key) return true;
-    return !this.isDeprecatedToolset(key);
+    if (this.isDeprecatedToolset(key)) return false;
+    // Filter out internal/system-level toolsets (e.g., read_file, list_files)
+    if (options?.internal) return false;
+    return true;
   }
 
   async getToolsetInventory(): Promise<
@@ -107,6 +117,8 @@ export class ToolService {
 
   /**
    * Load toolset inventory from sources (builtin + external)
+   * Note: This is for /tool/inventory/list API, which includes all tools for rendering.
+   * Internal tools are NOT filtered here as they need to be available for ToolCall rendering.
    */
   private async loadToolsetInventory(): Promise<ToolsetDefinition[]> {
     const builtinInventory = Object.values(builtinToolsetInventory).map((toolset) => ({
@@ -166,11 +178,18 @@ export class ToolService {
     return [...authorizedItems, ...unauthorizedItems];
   }
 
+  /**
+   * List builtin tools for mentionList.
+   * Filters out internal (system-level) tools that are auto-included.
+   */
   listBuiltinTools(): GenericToolset[] {
     return Object.values(builtinToolsetInventory)
       .filter(
         (toolset) =>
-          Boolean(toolset.definition) && this.shouldExposeToolset(toolset.definition.key),
+          Boolean(toolset.definition) &&
+          this.shouldExposeToolset(toolset.definition.key, {
+            internal: toolset.definition.internal,
+          }),
       )
       .map((toolset) => ({
         type: ToolsetType.REGULAR,
@@ -981,7 +1000,7 @@ export class ToolService {
 
     let copilotTools: DynamicStructuredTool[] = [];
     if (toolsets.find((t) => t.type === ToolsetType.REGULAR && t.id === 'copilot')) {
-      copilotTools = this.instantiateCopilotToolsets();
+      copilotTools = this.instantiateCopilotToolsets(user, engine);
     }
 
     // Regular toolsets now include both regular and config_based (mapped to 'regular' type)
@@ -1035,17 +1054,47 @@ export class ToolService {
       );
   }
 
-  private instantiateCopilotToolsets(): DynamicStructuredTool[] {
-    const toolsetInstance = new GenerateWorkflow();
+  private instantiateCopilotToolsets(user: User, engine: SkillEngine): DynamicStructuredTool[] {
+    const params = {
+      user,
+      reflyService: engine.service,
+    };
+    const generateWorkflow = new GenerateWorkflow(params);
+    const patchWorkflow = new PatchWorkflow(params);
+    const getWorkflowSummary = new GetWorkflowSummary(params);
 
     return [
       new DynamicStructuredTool({
         name: 'copilot_generate_workflow',
-        description: toolsetInstance.description,
-        schema: toolsetInstance.schema,
-        func: toolsetInstance.invoke.bind(toolsetInstance),
+        description: generateWorkflow.description,
+        schema: generateWorkflow.schema,
+        func: generateWorkflow.invoke.bind(generateWorkflow),
         metadata: {
-          name: toolsetInstance.name,
+          name: generateWorkflow.name,
+          type: 'copilot',
+          toolsetKey: 'copilot',
+          toolsetName: 'Copilot',
+        },
+      }),
+      new DynamicStructuredTool({
+        name: 'copilot_patch_workflow',
+        description: patchWorkflow.description,
+        schema: patchWorkflow.schema,
+        func: patchWorkflow.invoke.bind(patchWorkflow),
+        metadata: {
+          name: patchWorkflow.name,
+          type: 'copilot',
+          toolsetKey: 'copilot',
+          toolsetName: 'Copilot',
+        },
+      }),
+      new DynamicStructuredTool({
+        name: 'copilot_get_workflow_summary',
+        description: getWorkflowSummary.description,
+        schema: getWorkflowSummary.schema,
+        func: getWorkflowSummary.invoke.bind(getWorkflowSummary),
+        metadata: {
+          name: getWorkflowSummary.name,
           type: 'copilot',
           toolsetKey: 'copilot',
           toolsetName: 'Copilot',
