@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { OnEvent } from '@nestjs/event-emitter';
 import { WorkflowCompletedEvent, WorkflowFailedEvent } from '../workflow/workflow.events';
+import { CanvasDeletedEvent } from '../canvas/canvas.events';
 import { PrismaService } from '../common/prisma.service';
 import { RedisService } from '../common/redis.service';
 import { NotificationService } from '../notification/notification.service';
@@ -9,6 +10,7 @@ import { CreditService } from '../credit/credit.service';
 import {
   generateScheduleSuccessEmail,
   generateScheduleFailedEmail,
+  formatDateTime,
 } from './schedule-email-templates';
 import {
   classifyScheduleError,
@@ -54,6 +56,7 @@ export class ScheduleEventListener {
     const eventType = status === 'success' ? 'workflow.completed' : 'workflow.failed';
     let record: { uid: string } | null = null;
     let counterDecremented = false;
+    const isScheduledTrigger = event.triggerType === 'scheduled';
 
     try {
       this.logger.log(`Processing ${eventType} event for schedule record ${event.scheduleId}`);
@@ -65,8 +68,10 @@ export class ScheduleEventListener {
         return;
       }
 
-      // 2. Decrement Redis counter
-      counterDecremented = await this.decrementRedisCounter(record.uid);
+      // 2. Decrement Redis counter (only for scheduled runs)
+      if (isScheduledTrigger) {
+        counterDecremented = await this.decrementRedisCounter(record.uid);
+      }
 
       // 3. Calculate credit usage
       const creditUsed = await this.calculateCreditUsage(record.uid, event.executionId);
@@ -90,13 +95,15 @@ export class ScheduleEventListener {
       // 5. Update database
       await this.updateScheduleRecord(event.scheduleId!, updateData);
 
-      // 6. Send notification email
-      await this.sendEmail(event, status);
+      // 6. Send notification email (only for scheduled runs)
+      if (isScheduledTrigger) {
+        await this.sendEmail(event, status);
+      }
     } catch (error: any) {
       this.logger.error(`Failed to process ${eventType} event: ${error.message}`);
 
       // Ensure Redis counter is decremented in error case
-      if (record?.uid && !counterDecremented) {
+      if (isScheduledTrigger && record?.uid && !counterDecremented) {
         await this.decrementRedisCounter(record.uid, true);
       }
     }
@@ -192,16 +199,19 @@ export class ScheduleEventListener {
         where: { scheduleRecordId: event.scheduleId },
       });
       const scheduleName = scheduleRecord?.workflowTitle || 'Scheduled Workflow';
-      const nextRunTime = await this.calculateNextRunTime(scheduleRecord?.scheduleId);
+      const { nextRunTime, timezone } = await this.calculateNextRunTime(scheduleRecord?.scheduleId);
 
       const scheduleRecordId = scheduleRecord?.scheduleRecordId || '';
       const origin = this.config.get<string>('origin');
       const runDetailsLink = `${origin}/run-history/${scheduleRecordId}`;
 
+      // Use scheduledAt as the run time
+      const scheduledAtDate = scheduleRecord?.scheduledAt || new Date();
+
       const emailData = {
         userName: fullUser.nickname || 'User',
         scheduleName,
-        runTime: new Date().toLocaleString(),
+        scheduledAt: formatDateTime(scheduledAtDate, timezone),
         nextRunTime,
         schedulesLink: runDetailsLink,
         runDetailsLink,
@@ -230,30 +240,125 @@ export class ScheduleEventListener {
 
   /**
    * Calculate next run time from schedule cron expression
+   * Returns both the formatted time string and the timezone for consistent formatting
    */
-  private async calculateNextRunTime(scheduleId: string | undefined): Promise<string> {
+  private async calculateNextRunTime(
+    scheduleId: string | undefined,
+  ): Promise<{ nextRunTime: string; timezone: string }> {
+    const defaultTimezone = 'Asia/Shanghai';
+
     if (!scheduleId) {
-      return 'Check Dashboard';
+      return { nextRunTime: 'Check Dashboard', timezone: defaultTimezone };
     }
 
     const schedule = await this.prisma.workflowSchedule.findUnique({
       where: { scheduleId },
     });
 
+    const timezone = schedule?.timezone || defaultTimezone;
+
     if (!schedule?.cronExpression) {
-      return 'Check Dashboard';
+      return { nextRunTime: 'Check Dashboard', timezone };
     }
 
     try {
       const interval = CronExpressionParser.parse(schedule.cronExpression, {
-        tz: schedule.timezone || 'Asia/Shanghai',
+        tz: timezone,
       });
-      return interval.next().toDate().toLocaleString();
+      return { nextRunTime: formatDateTime(interval.next().toDate(), timezone), timezone };
     } catch (err: any) {
       this.logger.warn(
         `Failed to calculate next run time for schedule ${scheduleId}: ${err?.message}`,
       );
-      return 'Check Dashboard';
+      return { nextRunTime: 'Check Dashboard', timezone };
+    }
+  }
+
+  /**
+   * Handle canvas.deleted event - release associated schedule resources
+   *
+   * When a canvas is deleted, we need to:
+   * 1. Soft-delete and disable all associated WorkflowSchedule records
+   * 2. Update pending/scheduled records to 'failed' status
+   * 3. Leave processing/running records as-is (they will complete normally, but won't be rescheduled)
+   *
+   * Note: We don't interrupt processing/running tasks because:
+   * - The workflow is already executing and interrupting might cause data inconsistency
+   * - The executor (ScheduleProcessor) will detect the deleted schedule on next execution attempt
+   */
+  @OnEvent('canvas.deleted')
+  async handleCanvasDeleted(event: CanvasDeletedEvent) {
+    const { canvasId, uid } = event;
+    this.logger.log(`Processing canvas.deleted event for canvas ${canvasId}`);
+
+    try {
+      // 1. Find all schedules associated with this canvas
+      const associatedSchedules = await this.prisma.workflowSchedule.findMany({
+        where: { canvasId, uid, deletedAt: null },
+        select: { scheduleId: true },
+      });
+
+      if (associatedSchedules.length === 0) {
+        this.logger.debug(`No active schedules found for canvas ${canvasId}`);
+        return;
+      }
+
+      const scheduleIds = associatedSchedules.map((s) => s.scheduleId);
+      this.logger.log(
+        `Releasing ${scheduleIds.length} schedule(s) for deleted canvas ${canvasId}: ${scheduleIds.join(', ')}`,
+      );
+
+      // 2. Soft-delete and disable schedules
+      await this.prisma.workflowSchedule.updateMany({
+        where: { canvasId, uid, deletedAt: null },
+        data: {
+          isEnabled: false,
+          deletedAt: new Date(),
+          nextRunAt: null, // Clear next run time to prevent any race conditions
+        },
+      });
+
+      // 3. Update pending/scheduled records to 'failed' status
+      // Note: We do NOT update 'processing' or 'running' records because:
+      // - They are currently executing and should complete their execution
+      // - The workflow.completed/workflow.failed events will handle their final status
+      // - When they try to reschedule, they will find the schedule is deleted
+      const updateResult = await this.prisma.workflowScheduleRecord.updateMany({
+        where: {
+          scheduleId: { in: scheduleIds },
+          status: { in: ['pending', 'scheduled'] },
+        },
+        data: {
+          status: 'failed',
+          failureReason: ScheduleFailureReason.CANVAS_DELETED,
+          errorDetails: JSON.stringify({
+            reason: 'Canvas was deleted, schedule has been released',
+            deletedAt: new Date().toISOString(),
+          }),
+          completedAt: new Date(),
+        },
+      });
+
+      // 4. Log processing/running records for visibility
+      const processingCount = await this.prisma.workflowScheduleRecord.count({
+        where: {
+          scheduleId: { in: scheduleIds },
+          status: { in: ['processing', 'running'] },
+        },
+      });
+
+      if (processingCount > 0) {
+        this.logger.log(
+          `Canvas ${canvasId}: ${processingCount} task(s) are still processing/running, they will complete normally`,
+        );
+      }
+
+      this.logger.log(
+        `Successfully released schedules for canvas ${canvasId}: ${updateResult.count} pending records failed`,
+      );
+    } catch (error: any) {
+      this.logger.error(`Failed to release schedules for canvas ${canvasId}: ${error?.message}`);
+      // Don't throw - this is a cleanup operation and shouldn't block canvas deletion
     }
   }
 }

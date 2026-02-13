@@ -2,8 +2,8 @@ import { Statsig, StatsigUser } from '@statsig/statsig-node-core';
 
 let statsig: Statsig | null = null;
 
-type StatsigUserCustomValue = string | number | boolean | Array<string | number | boolean>;
-type StatsigUserCustom = Record<string, StatsigUserCustomValue>;
+export type StatsigUserCustomValue = string | number | boolean | Array<string | number | boolean>;
+export type StatsigUserCustom = Record<string, StatsigUserCustomValue>;
 
 export const setupStatsig = async () => {
   const secretKey = process.env.STATSIG_SECRET_KEY;
@@ -30,7 +30,37 @@ export const updateUserProperties = (
     return;
   }
 
-  statsig.identify(new StatsigUser({ userID: user.uid, email: user.email, custom }));
+  const cleanedCustom: Record<string, StatsigUserCustomValue> = {};
+  for (const [key, value] of Object.entries(custom)) {
+    if (value !== null && value !== undefined) {
+      cleanedCustom[key] = value;
+    }
+  }
+
+  try {
+    statsig.identify(
+      new StatsigUser({ userID: user.uid, email: user.email, custom: cleanedCustom }),
+    );
+  } catch (error) {
+    console.error('Failed to update user properties:', error);
+  }
+};
+
+/**
+ * Convert all values in an object to strings recursively
+ */
+const convertMetadataToStrings = (obj: Record<string, any>): Record<string, string> => {
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (value === null || value === undefined) {
+      result[key] = String(value ?? '');
+    } else if (typeof value === 'object') {
+      result[key] = JSON.stringify(value);
+    } else {
+      result[key] = String(value);
+    }
+  }
+  return result;
 };
 
 export const logEvent = (
@@ -43,10 +73,12 @@ export const logEvent = (
     return;
   }
 
+  const stringMetadata = metadata ? convertMetadataToStrings(metadata) : undefined;
+
   statsig.logEvent(
     new StatsigUser({ userID: user.uid, email: user.email }),
     eventName,
     value,
-    metadata,
+    stringMetadata,
   );
 };

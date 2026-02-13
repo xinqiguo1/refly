@@ -20,6 +20,7 @@ import {
 import {
   generateInsufficientCreditsEmail,
   generateScheduleFailedEmail,
+  formatDateTime,
 } from './schedule-email-templates';
 import { NotificationService } from '../notification/notification.service';
 import { ScheduleMetrics } from './schedule.metrics';
@@ -101,6 +102,29 @@ export class ScheduleProcessor extends WorkerHost {
       let incrSucceeded = false;
 
       try {
+        // Check if Redis counter exists, if not recover from database
+        const counterExists = await this.redisService.existsBoolean(redisKey);
+        if (!counterExists) {
+          // Redis counter doesn't exist (e.g., after Redis restart)
+          // Recover from database: count actual running records
+          const actualRunningCount = await this.prisma.workflowScheduleRecord.count({
+            where: {
+              uid,
+              status: { in: ['processing', 'running'] },
+            },
+          });
+
+          // Initialize Redis counter with actual database count
+          await this.redisService.setex(
+            redisKey,
+            this.scheduleConfig.userConcurrentTtl,
+            String(actualRunningCount),
+          );
+          this.logger.debug(
+            `Redis counter recovered from DB for user ${uid}: ${actualRunningCount} running records`,
+          );
+        }
+
         // Atomically increment counter
         const currentCount = await this.redisService.incr(redisKey);
         incrSucceeded = true;
@@ -159,66 +183,28 @@ export class ScheduleProcessor extends WorkerHost {
           throw new DelayedError();
         }
 
-        // DB check passed, try to increment Redis for tracking (best-effort)
+        // DB check passed, try to recover Redis counter from database
+        // Note: runningCount already calculated above, reuse it to avoid duplicate query
         try {
+          // Set Redis counter to match database state (recovery from Redis restart)
+          // Then increment for this job
+          await this.redisService.setex(
+            redisKey,
+            this.scheduleConfig.userConcurrentTtl,
+            String(runningCount),
+          );
           await this.redisService.incr(redisKey);
-          await this.redisService.expire(redisKey, this.scheduleConfig.userConcurrentTtl);
           redisCounterActive = true;
-          this.logger.debug(`Redis recovered, counter incremented for user ${uid}`);
-        } catch {
+          this.logger.debug(
+            `Redis recovered, counter restored from DB (${runningCount}) and incremented for user ${uid}`,
+          );
+        } catch (recoverError) {
           // Redis still unavailable, continue without Redis tracking
           this.logger.warn(
             `Redis still unavailable for user ${uid}, continuing without Redis tracking`,
+            recoverError,
           );
         }
-      }
-
-      // 2. Check if schedule still exists and is enabled
-      // This prevents execution of tasks for deleted/disabled schedules
-      const schedule = await this.prisma.workflowSchedule.findUnique({
-        where: { scheduleId },
-      });
-
-      if (!schedule || schedule.deletedAt || !schedule.isEnabled) {
-        this.logger.warn(
-          `Schedule ${scheduleId} is deleted/disabled, skipping execution for job ${job.id}`,
-        );
-
-        // Rollback Redis counter since we're not proceeding with execution
-        if (redisCounterActive) {
-          try {
-            const redisKey = `${SCHEDULE_REDIS_KEYS.USER_CONCURRENT_PREFIX}${uid}`;
-            await this.redisService.decr(redisKey);
-            this.logger.debug(`Rolled back Redis counter for user ${uid} (schedule skipped)`);
-          } catch (redisError) {
-            this.logger.warn(`Failed to rollback Redis counter for user ${uid}`, redisError);
-          }
-        }
-
-        // Record skipped metric
-        const failureReason = schedule?.deletedAt
-          ? ScheduleFailureReason.SCHEDULE_DELETED
-          : ScheduleFailureReason.SCHEDULE_DISABLED;
-        this.metrics.execution.skipped(
-          schedule?.deletedAt ? 'schedule_deleted' : 'schedule_disabled',
-        );
-        // Update WorkflowScheduleRecord to 'skipped' if exists
-        if (existingRecordId) {
-          await this.prisma.workflowScheduleRecord.update({
-            where: { scheduleRecordId: existingRecordId },
-            data: {
-              status: 'skipped',
-              failureReason,
-              errorDetails: JSON.stringify({
-                reason: schedule?.deletedAt
-                  ? 'Schedule was deleted before execution'
-                  : 'Schedule was disabled before execution',
-              }),
-              completedAt: new Date(),
-            },
-          });
-        }
-        return null; // Exit gracefully without error
       }
 
       // 3. Create simple user object (only uid needed, avoid BigInt serialization issues)
@@ -255,6 +241,56 @@ export class ScheduleProcessor extends WorkerHost {
           scheduleRecordId = existingRecord.scheduleRecordId;
           this.logger.log(`Found existing record ${scheduleRecordId} for execution`);
         }
+      }
+
+      // 3.1 Check if the current record has already failed
+      // This prevents re-execution of already failed records
+      if (existingRecord && existingRecord.status === 'failed') {
+        this.logger.warn(
+          `Schedule record ${scheduleRecordId} has already failed with reason ${existingRecord.failureReason}, skipping execution for job ${job.id}`,
+        );
+
+        // Rollback Redis counter since we're not proceeding with execution
+        if (redisCounterActive) {
+          try {
+            const redisKey = `${SCHEDULE_REDIS_KEYS.USER_CONCURRENT_PREFIX}${uid}`;
+            await this.redisService.decr(redisKey);
+            this.logger.debug(`Rolled back Redis counter for user ${uid} (record already failed)`);
+          } catch (redisError) {
+            this.logger.warn(`Failed to rollback Redis counter for user ${uid}`, redisError);
+          }
+        }
+
+        // Record metric based on failure reason
+        const failureReason = existingRecord.failureReason || 'unknown_error';
+        this.metrics.execution.fail('cron', failureReason);
+        return null; // Exit gracefully without error
+      }
+
+      const schedule = await this.prisma.workflowSchedule.findUnique({
+        where: { scheduleId },
+      });
+
+      // Check if schedule exists (may have been deleted while job was queued)
+      if (!schedule) {
+        this.logger.warn(
+          `Schedule ${scheduleId} not found, likely deleted while job was queued. Skipping execution for job ${job.id}`,
+        );
+
+        // Rollback Redis counter since we're not proceeding with execution
+        if (redisCounterActive) {
+          try {
+            const redisKey = `${SCHEDULE_REDIS_KEYS.USER_CONCURRENT_PREFIX}${uid}`;
+            await this.redisService.decr(redisKey);
+            this.logger.debug(`Rolled back Redis counter for user ${uid} (schedule not found)`);
+          } catch (redisError) {
+            this.logger.warn(`Failed to rollback Redis counter for user ${uid}`, redisError);
+          }
+        }
+
+        // Record metric
+        this.metrics.execution.fail('cron', 'schedule_not_found');
+        return null; // Exit gracefully without error
       }
 
       // 4. Create new WorkflowScheduleRecord only if no existing record was found
@@ -346,7 +382,7 @@ export class ScheduleProcessor extends WorkerHost {
         // - processCanvasForShare is designed for sharing existing content (creates ShareRecords)
         // - Schedule needs raw canvas data for execution (no ShareRecords needed)
         // - processCanvasForShare would fail if skillResponse nodes have no action results
-        canvasData = await this.createSnapshotFromCanvas(user, canvasId);
+        canvasData = await this.canvasService.createSnapshotFromCanvas(user, canvasId);
 
         // Upload snapshot to private storage
         snapshotStorageKey = `schedules/${uid}/${scheduleRecordId}/snapshot.json`;
@@ -393,13 +429,14 @@ export class ScheduleProcessor extends WorkerHost {
           // Send Email
           if (fullUser.email) {
             // Calculate next run time from cron expression
+            const timezone = schedule.timezone || 'Asia/Shanghai';
             let nextRunTime: string | undefined;
             if (schedule.cronExpression) {
               try {
                 const interval = CronExpressionParser.parse(schedule.cronExpression, {
-                  tz: schedule.timezone || 'Asia/Shanghai',
+                  tz: timezone,
                 });
-                nextRunTime = interval.next().toDate().toLocaleString();
+                nextRunTime = formatDateTime(interval.next().toDate(), timezone);
               } catch (err) {
                 this.logger.warn(`Failed to calculate next run time for email: ${err}`);
               }
@@ -409,7 +446,7 @@ export class ScheduleProcessor extends WorkerHost {
               userName: fullUser.nickname || 'User',
               scheduleName: schedule.name || 'Scheduled Workflow',
               currentBalance: creditBalance.creditBalance,
-              schedulesLink: `${this.config.get<string>('origin')}/workflow/${canvasId}`,
+              schedulesLink: `${this.config.get<string>('origin')}/run-history/${scheduleRecordId}`,
               nextRunTime,
             });
             await this.notificationService.sendEmail(
@@ -430,7 +467,7 @@ export class ScheduleProcessor extends WorkerHost {
       // This indicates the workflow is actually being executed
       // Extract used tools from canvas nodes
       const toolsetsWithNodes = extractToolsetsWithNodes(canvasData?.nodes ?? []);
-      const usedToolIds = toolsetsWithNodes.map((t) => t.toolset?.id).filter(Boolean);
+      const usedToolIds = toolsetsWithNodes.map((t) => t.toolset?.toolset?.key).filter(Boolean);
 
       await this.prisma.workflowScheduleRecord.update({
         where: { scheduleRecordId },
@@ -540,24 +577,33 @@ export class ScheduleProcessor extends WorkerHost {
               where: { scheduleId },
             });
 
-            // 3. Calculate next run
+            // 2.1 Get schedule record to retrieve triggeredAt
+            const scheduleRecord = await this.prisma.workflowScheduleRecord.findUnique({
+              where: { scheduleRecordId },
+            });
+
+            // 3. Calculate next run with timezone
+            const timezone = schedule?.timezone || 'Asia/Shanghai';
             let nextRunTime = 'Check Dashboard';
             if (schedule?.cronExpression) {
               try {
                 const interval = CronExpressionParser.parse(schedule.cronExpression, {
-                  tz: schedule.timezone || 'Asia/Shanghai',
+                  tz: timezone,
                 });
-                nextRunTime = interval.next().toDate().toLocaleString();
+                nextRunTime = formatDateTime(interval.next().toDate(), timezone);
               } catch (_) {
                 // Ignore cron parse error
               }
             }
 
-            // 4. Send email
+            // 4. Use scheduledAt as the run time
+            const scheduledAtDate = scheduleRecord?.scheduledAt || new Date();
+
+            // 5. Send email
             const { subject, html } = generateScheduleFailedEmail({
               userName: fullUser.nickname || 'User',
               scheduleName: schedule?.name || 'Scheduled Workflow',
-              runTime: new Date().toLocaleString(),
+              scheduledAt: formatDateTime(scheduledAtDate, timezone),
               nextRunTime,
               schedulesLink: `${this.config.get<string>('origin')}/run-history/${scheduleRecordId}`,
               runDetailsLink: `${this.config.get<string>('origin')}/run-history/${scheduleRecordId}`,
@@ -609,76 +655,6 @@ export class ScheduleProcessor extends WorkerHost {
       visibility: 'private',
       storageKey,
     });
-  }
-
-  /**
-   * Create snapshot from canvas data with files and resources
-   * This is a simpler alternative to processCanvasForShare that doesn't create ShareRecords
-   */
-  private async createSnapshotFromCanvas(
-    user: { uid: string },
-    canvasId: string,
-  ): Promise<RawCanvasData> {
-    // 1. Get raw canvas data (nodes, edges, variables)
-    const rawData = await this.canvasService.getCanvasRawData(user as any, canvasId);
-
-    // 2. Get drive files associated with this canvas
-    const driveFiles = await this.prisma.driveFile.findMany({
-      where: {
-        uid: user.uid,
-        canvasId,
-        scope: 'present',
-        deletedAt: null,
-      },
-    });
-
-    const files = driveFiles.map((file) => ({
-      fileId: file.fileId,
-      canvasId: file.canvasId,
-      name: file.name,
-      type: file.type,
-      category: file.category,
-      size: Number(file.size),
-      source: file.source,
-      scope: file.scope,
-      summary: file.summary ?? undefined,
-      variableId: file.variableId ?? undefined,
-      resultId: file.resultId ?? undefined,
-      resultVersion: file.resultVersion ?? undefined,
-      storageKey: file.storageKey ?? undefined,
-      createdAt: file.createdAt.toJSON(),
-      updatedAt: file.updatedAt.toJSON(),
-    }));
-
-    // 3. Get resources associated with this canvas
-    const resources = await this.prisma.resource.findMany({
-      where: {
-        uid: user.uid,
-        canvasId,
-        deletedAt: null,
-      },
-      select: {
-        resourceId: true,
-        title: true,
-        resourceType: true,
-        storageKey: true,
-        storageSize: true,
-        contentPreview: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    });
-
-    // 4. Combine into snapshot format
-    return {
-      title: rawData.title,
-      canvasId: rawData.canvasId,
-      variables: rawData.variables || [],
-      nodes: rawData.nodes || [],
-      edges: rawData.edges || [],
-      files: files as any,
-      resources: resources as any,
-    } as RawCanvasData;
   }
 
   // classifyError moved to schedule.constants.ts as classifyScheduleError

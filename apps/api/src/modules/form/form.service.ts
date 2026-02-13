@@ -11,6 +11,10 @@ export class FormService {
     private readonly configService: ConfigService,
   ) {}
 
+  private isOnboardingEnabled(): boolean {
+    return this.configService.get('auth.onboarding.enabled') ?? false;
+  }
+
   private extractRoleFromAnswers(answers: string): string | null {
     if (!answers?.trim()) {
       return null;
@@ -79,17 +83,43 @@ export class FormService {
     }
   }
 
-  async hasFilledForm(uid: string): Promise<boolean> {
-    const user = await this.prisma.user.findUnique({
-      where: { uid },
-      select: { preferences: true },
-    });
-
-    if (!user?.preferences) {
-      return false;
+  async hasFilledForm(
+    uid: string,
+    preferenceJson?: string,
+    answersJson?: string,
+  ): Promise<{ hasFilledForm: boolean; identity: string | null }> {
+    // If onboarding is disabled, skip form requirement
+    if (!this.isOnboardingEnabled()) {
+      return { hasFilledForm: true, identity: null };
     }
 
-    const preferences = JSON.parse(user.preferences);
-    return preferences.hasFilledForm ?? true;
+    const [user, answers] = await Promise.all([
+      preferenceJson === undefined
+        ? this.prisma.user.findUnique({
+            where: { uid },
+            select: { preferences: true },
+          })
+        : Promise.resolve(null),
+      answersJson === undefined
+        ? this.prisma.formSubmission.findFirst({
+            where: { uid },
+            select: { answers: true },
+          })
+        : Promise.resolve(answersJson ? { answers: answersJson } : null),
+    ]);
+
+    const finalPreferenceJson = preferenceJson ?? user?.preferences;
+    const finalAnswersJson = answersJson ?? answers?.answers;
+    const identity = this.extractRoleFromAnswers(finalAnswersJson);
+
+    if (!finalPreferenceJson) {
+      return { hasFilledForm: false, identity: identity ?? null };
+    }
+
+    const preferences = JSON.parse(finalPreferenceJson);
+    return {
+      hasFilledForm: preferences.hasFilledForm ?? true,
+      identity: identity ?? null,
+    };
   }
 }

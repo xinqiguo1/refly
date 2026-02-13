@@ -1,7 +1,7 @@
 import { useEffect, useCallback, useMemo, memo, useState } from 'react';
 import { time } from '@refly-packages/ai-workspace-common/utils/time';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from '@refly-packages/ai-workspace-common/utils/router';
+import { useNavigate, useLocation } from '@refly-packages/ai-workspace-common/utils/router';
 
 import getClient from '@refly-packages/ai-workspace-common/requests/proxiedRequest';
 
@@ -12,7 +12,7 @@ import { Spin } from '@refly-packages/ai-workspace-common/components/common/spin
 import { useFetchDataList } from '@refly-packages/ai-workspace-common/hooks/use-fetch-data-list';
 import { LOCALE } from '@refly/common-types';
 import { Search, Sort, SortAsc } from 'refly-icons';
-import EmptyImage from '@refly-packages/ai-workspace-common/assets/noResource.svg';
+import EmptyImage from '@refly-packages/ai-workspace-common/assets/noResource.webp';
 import './index.scss';
 import { WorkflowActionDropdown } from '@refly-packages/ai-workspace-common/components/workflow-list/workflowActionDropdown';
 import { useCreateCanvas } from '@refly-packages/ai-workspace-common/hooks/canvas/use-create-canvas';
@@ -20,7 +20,7 @@ import { ListOrder, ShareUser, WorkflowSchedule } from '@refly/openapi-schema';
 import { UsedToolsets } from '@refly-packages/ai-workspace-common/components/workflow-list/used-toolsets';
 import { ScheduleColumn } from '@refly-packages/ai-workspace-common/components/workflow-list/schedule-column';
 import { WorkflowFilters } from '@refly-packages/ai-workspace-common/components/workflow-list/workflow-filters';
-import defaultAvatar from '@refly-packages/ai-workspace-common/assets/refly_default_avatar.png';
+import defaultAvatar from '../../assets/refly_default_avatar_v2.webp';
 import { useDebouncedCallback } from 'use-debounce';
 import { useSiderStoreShallow, useSubscriptionStoreShallow } from '@refly/stores';
 import { SettingItem } from '@refly-packages/ai-workspace-common/components/canvas/front-page';
@@ -28,14 +28,17 @@ import { SettingItem } from '@refly-packages/ai-workspace-common/components/canv
 const WorkflowList = memo(() => {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
+  const location = useLocation();
   const language = i18n.languages?.[0];
   const [searchValue, setSearchValue] = useState('');
   const [debouncedSearchValue, setDebouncedSearchValue] = useState('');
 
   const [orderType, setOrderType] = useState<ListOrder>('updationDesc');
 
-  // Filter state
-  const [hasScheduleFilter, setHasScheduleFilter] = useState(false);
+  // Filter state - initialize from navigation state if coming from schedule button
+  const [hasScheduleFilter, setHasScheduleFilter] = useState(() => {
+    return location.state?.autoEnableScheduleFilter === true;
+  });
 
   const { debouncedCreateCanvas, isCreating: createCanvasLoading } = useCreateCanvas({});
 
@@ -67,6 +70,13 @@ const WorkflowList = memo(() => {
   const debouncedSetSearchValue = useDebouncedCallback((value: string) => {
     setDebouncedSearchValue(value);
   }, 300);
+
+  // Update schedule filter when location state changes (e.g., from View Schedule button)
+  useEffect(() => {
+    if (location.state?.autoEnableScheduleFilter === true) {
+      setHasScheduleFilter(true);
+    }
+  }, [location.state]);
 
   // Debounce search value changes
   useEffect(() => {
@@ -104,7 +114,7 @@ const WorkflowList = memo(() => {
   const handleEdit = useCallback(
     (canvas: Canvas) => {
       setIsManualCollapse(false);
-      navigate(`/canvas/${canvas.canvasId}`);
+      navigate(`/workflow/${canvas.canvasId}`);
     },
     [navigate, setIsManualCollapse],
   );
@@ -185,7 +195,6 @@ const WorkflowList = memo(() => {
         dataIndex: 'schedule',
         key: 'schedule',
         width: 140,
-        align: 'center' as const,
         render: (schedule: WorkflowSchedule, record: Canvas) => {
           return (
             <ScheduleColumn
@@ -203,7 +212,6 @@ const WorkflowList = memo(() => {
         dataIndex: 'owner',
         key: 'owner',
         width: 150,
-        align: 'center' as const,
         render: (owner: ShareUser) => {
           const ownerName = owner?.name || t('common.untitled');
           const ownerNickname = owner?.nickname;
@@ -227,9 +235,8 @@ const WorkflowList = memo(() => {
         dataIndex: 'updatedAt',
         key: 'updatedAt',
         width: 120,
-        align: 'center' as const,
         render: (updatedAt: string) => (
-          <span className="text-sm text-gray-500 dark:text-gray-400">
+          <span className="text-xs text-gray-500 dark:text-gray-400">
             {time(updatedAt, language as LOCALE)
               .utc()
               .fromNow()}
@@ -240,11 +247,10 @@ const WorkflowList = memo(() => {
         title: t('workflowList.tableTitle.actions'),
         key: 'actions',
         width: 106,
-        align: 'center' as const,
         fixed: 'right' as const,
         render: (_, record: Canvas) => {
           return (
-            <div className="flex items-center justify-center flex-shrink-0">
+            <div className="flex items-center flex-shrink-0">
               <Button
                 type="text"
                 size="small"
@@ -346,7 +352,7 @@ const WorkflowList = memo(() => {
               dataSource={dataList}
               rowKey="canvasId"
               pagination={false}
-              scroll={{ y: 'calc(var(--screen-height) - 190px)' }}
+              scroll={{ y: 'calc(var(--screen-height) - 220px)' }}
               className="workflow-table flex-1"
               size="middle"
               onRow={(record: Canvas) => ({

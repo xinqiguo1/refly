@@ -9,7 +9,7 @@ import {
   useGetCreditUsageByCanvasId,
 } from '@refly-packages/ai-workspace-common/queries/queries';
 import { GenericToolset, RawCanvasData, ToolsetDefinition, UserTool } from '@refly/openapi-schema';
-import IssueImage from '@refly-packages/ai-workspace-common/assets/issue.svg';
+import IssueImage from '@refly-packages/ai-workspace-common/assets/issue.png';
 import React from 'react';
 import { ToolsetIcon } from '@refly-packages/ai-workspace-common/components/canvas/common/toolset-icon';
 import cn from 'classnames';
@@ -186,7 +186,7 @@ const ReferencedNodesDisplay = React.memo(({ nodes }: { nodes: Array<ReferencedN
   return (
     <div className="px-2 py-1 bg-refly-bg-control-z0 rounded-lg mt-3 flex items-center gap-1">
       <div className="text-refly-text-2 text-xs leading-4 flex-shrink-0 whitespace-nowrap">
-        {t('canvas.workflowDepencency.referencedNodes')}:
+        {t('canvas.workflowDependency.referencedNodes')}:
       </div>
       <div ref={containerRef} className="flex items-center min-w-0 flex-1 overflow-hidden">
         {visibleNodes.map((node, index) => (
@@ -325,6 +325,8 @@ const useRequiredInputsCheck = (canvasId: string) => {
   }, [workflowVariables]);
 };
 
+export { useRequiredInputsCheck };
+
 // Credit Insufficient Block component for showing insufficient credits warning
 const CreditInsufficientBlock = React.memo(
   ({
@@ -345,9 +347,11 @@ const CreditInsufficientBlock = React.memo(
           <span className="text-refly-text-0 text-sm leading-5 whitespace-nowrap font-medium">
             {t('canvas.workflowDependency.notEnoughCredits', 'Not enough credits to run')}
           </span>
-          <span className="text-refly-text-2 text-sm leading-5 whitespace-nowrap">
-            {t('canvas.workflowDependency.runCost', 'Run cost: {{cost}}', { cost: creditUsage })}
-          </span>
+          {creditUsage > 0 && (
+            <span className="text-refly-text-2 text-sm leading-5 whitespace-nowrap">
+              {t('canvas.workflowDependency.runCost', 'Run cost: {{cost}}', { cost: creditUsage })}
+            </span>
+          )}
         </div>
         <Button
           className="custom-upgrade-button text-xs leading-5 font-semibold cursor-pointer whitespace-nowrap px-3 py-1 rounded-md h-auto"
@@ -379,17 +383,21 @@ const RequiredInputBlock = React.memo(
         <div className="flex items-center gap-2 flex-1 min-w-0">
           <div className="flex items-center gap-1 text-refly-func-danger-default text-sm leading-5 whitespace-nowrap">
             <RiErrorWarningFill size={26} color="#f93920" />
+            <span className="text-refly-text-0 text-sm leading-5 whitespace-nowrap font-medium">
+              Input
+            </span>
           </div>
-          <span className="text-refly-text-0 text-sm leading-5 whitespace-nowrap font-medium">
-            Input
-          </span>
-          <span className="text-refly-text-2 text-sm leading-5 whitespace-nowrap">
-            {t(
-              'canvas.workflowDependency.requiredInputNotFilled',
-              'Required input not filled: {{input_name}}',
-              { input_name: variable.name },
-            )}
-          </span>
+          <div className="flex flex-col gap-0 flex-1">
+            <span className="text-refly-text-2 text-sm leading-5 whitespace-nowrap">
+              {t('canvas.workflowDependency.requiredInputNotFilled')}
+            </span>
+            <span
+              className="text-refly-text-2 text-xs leading-5 font-medium truncate max-w-[200px]"
+              title={variable.name}
+            >
+              {t('canvas.workflowDependency.inputName', { input_name: variable.name })}
+            </span>
+          </div>
         </div>
         <Button
           className="custom-configure-button text-xs leading-5 font-semibold cursor-pointer whitespace-nowrap px-3 py-1 rounded-md h-auto"
@@ -412,10 +420,10 @@ const NoIssueContent = () => {
       <img src={IssueImage} className="w-[207px] h-[207px] object-cover" alt="workflow issues" />
       <div className="text-center space-y-1">
         <div className="text-refly-text-0 text-sm font-medium">
-          {t('canvas.workflowDepencency.youAreAwesome')}
+          {t('canvas.workflowDependency.youAreAwesome')}
         </div>
         <div className="text-refly-text-2 text-sm">
-          {t('canvas.workflowDepencency.everythingIsSet')}
+          {t('canvas.workflowDependency.everythingIsSet')}
         </div>
       </div>
     </div>
@@ -482,10 +490,12 @@ const ToolsDependencyContent = React.memo(
 
     // Check if credits are insufficient
     const isCreditInsufficient = useMemo(() => {
-      if (!isLogin || !isBalanceSuccess || !creditUsage) return false;
-      const requiredCredits = Number(creditUsage);
-      const isRequiredCreditsValid = Number.isFinite(requiredCredits) && requiredCredits > 0;
-      return isRequiredCreditsValid && creditBalance < requiredCredits;
+      if (!isLogin || !isBalanceSuccess) return false;
+      const requiredCredits = Number(creditUsage || 0);
+      // Show insufficient credits warning if:
+      // 1. User has no credits (creditBalance === 0), OR
+      // 2. Required credits > 0 AND user's balance < required credits
+      return creditBalance === 0 || (requiredCredits > 0 && creditBalance < requiredCredits);
     }, [isLogin, isBalanceSuccess, creditUsage, creditBalance]);
 
     // Helper function to get complete toolset definition
@@ -570,7 +580,7 @@ const ToolsDependencyContent = React.memo(
             <div className="flex flex-col min-w-0 flex-1">
               <div className="flex items-center">
                 <div className="text-base md:text-lg font-semibold truncate">
-                  {t('canvas.workflowDepencency.title')}
+                  {t('canvas.workflowDependency.title')}
                 </div>
                 {uninstalledCount > 0 && isLogin && (
                   <span className="text-refly-text-0 text-base font-bold">
@@ -583,7 +593,7 @@ const ToolsDependencyContent = React.memo(
                 isCreditInsufficient ||
                 (canvasId && requiredInputsCheck.count > 0)) && (
                 <div className="text-refly-text-2 text-xs font-normal">
-                  {t('canvas.workflowDepencency.subtitle')}
+                  {t('canvas.workflowDependency.subtitle')}
                 </div>
               )}
             </div>
@@ -599,9 +609,9 @@ const ToolsDependencyContent = React.memo(
         {isLoading ? null : (
           <div className="max-h-[400px] overflow-y-auto space-y-3">
             {/* Credit Insufficient Check */}
-            {isCreditInsufficient && creditUsage && (
+            {isCreditInsufficient && (
               <CreditInsufficientBlock
-                creditUsage={creditUsage}
+                creditUsage={creditUsage || 0}
                 onUpgradeClick={handleCreditUpgrade}
               />
             )}
@@ -680,14 +690,14 @@ const ToolsDependencyContent = React.memo(
                                     : 'text-refly-func-danger-default bg-refly-Colorful-red-light',
                                 )}
                               >
-                                {isInstalled ? t('canvas.workflowDepencency.installed') : null}
+                                {isInstalled ? t('canvas.workflowDependency.installed') : null}
                               </div>
                             )}
                           </div>
                           <div className="text-refly-text-2 text-xs leading-4 truncate">
                             {toolset.type === 'mcp'
-                              ? t('canvas.workflowDepencency.mcpUnavailable')
-                              : t('canvas.workflowDepencency.notAuthorized')}
+                              ? t('canvas.workflowDependency.mcpUnavailable')
+                              : t('canvas.workflowDependency.notAuthorized')}
                           </div>
                         </div>
 
@@ -701,7 +711,7 @@ const ToolsDependencyContent = React.memo(
                           >
                             {isPolling || isOpening
                               ? t('canvas.richChatInput.authorizing', '授权中...')
-                              : t('canvas.workflowDepencency.goToInstall')}
+                              : t('canvas.workflowDependency.goToInstall')}
                           </Button>
                         )}
                       </div>
@@ -1148,9 +1158,11 @@ export const ToolsDependency = ({
   // Check if credits are insufficient
   const isCreditInsufficient = useMemo(() => {
     if (!isLogin || !isBalanceSuccess) return false;
-    const requiredCredits = Number(estimatedCreditUsage);
-    const isRequiredCreditsValid = Number.isFinite(requiredCredits) && requiredCredits > 0;
-    return isRequiredCreditsValid && creditBalance < requiredCredits;
+    const requiredCredits = Number(estimatedCreditUsage || 0);
+    // Show insufficient credits warning if:
+    // 1. User has no credits (creditBalance === 0), OR
+    // 2. Required credits > 0 AND user's balance < required credits
+    return creditBalance === 0 || (requiredCredits > 0 && creditBalance < requiredCredits);
   }, [isLogin, isBalanceSuccess, estimatedCreditUsage, creditBalance]);
 
   const totalIssuesCount = useMemo(() => {

@@ -16,7 +16,7 @@ import { useActionResultStore, useActionResultStoreShallow } from '@refly/stores
 import { genNodeEntityId } from '@refly/utils/id';
 import { Position, useReactFlow } from '@xyflow/react';
 import { message, Typography } from 'antd';
-import { memo, useCallback, useEffect, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { CustomHandle } from './shared/custom-handle';
 import { getNodeCommonStyles } from './shared/styles';
@@ -29,18 +29,13 @@ import {
 } from '@refly-packages/ai-workspace-common/hooks/canvas';
 import { useActionPolling } from '@refly-packages/ai-workspace-common/hooks/canvas/use-action-polling';
 import { useGetNodeConnectFromDragCreateInfo } from '@refly-packages/ai-workspace-common/hooks/canvas/use-get-node-connect';
-import { usePilotRecovery } from '@refly-packages/ai-workspace-common/hooks/pilot/use-pilot-recovery';
+import { useFetchActionResult } from '@refly-packages/ai-workspace-common/hooks/canvas/use-fetch-action-result';
 import {
   useGetCreditBalance,
   useGetCreditUsageByResultId,
-  useGetPilotSessionDetail,
 } from '@refly-packages/ai-workspace-common/queries/queries';
 import { processContentPreview } from '@refly-packages/ai-workspace-common/utils/content';
-import {
-  usePilotStoreShallow,
-  useCanvasNodesStoreShallow,
-  useCanvasStoreShallow,
-} from '@refly/stores';
+import { useCanvasNodesStoreShallow, useCanvasStoreShallow } from '@refly/stores';
 import cn from 'classnames';
 
 import { SkillResponseContentPreview } from '@refly-packages/ai-workspace-common/components/canvas/nodes/shared/skill-response-content-preview';
@@ -79,12 +74,20 @@ const NodeStatusBar = memo(
     error?: string;
     version?: number;
   }) => {
+    // Get result version from store as fallback to ensure we use the latest version
+    const { result } = useActionResultStoreShallow((state) => ({
+      result: state.resultMap[resultId],
+    }));
+
+    // Prefer result.version over prop version to ensure we use the latest version
+    const effectiveVersion = result?.version ?? version;
+
     // Query credit usage when skill is completed
     const { data: creditUsage } = useGetCreditUsageByResultId(
       {
         query: {
           resultId: resultId ?? '',
-          version: version?.toString(),
+          version: effectiveVersion?.toString(),
         },
       },
       undefined,
@@ -256,22 +259,6 @@ export const SkillResponseNode = memo(
       onHoverEnd(selected);
     }, [onHoverEnd, selected]);
 
-    // Get current pilot session info
-    const activeSessionId = usePilotStoreShallow(
-      (state) => state.activeSessionIdByCanvas[canvasId || ''],
-    );
-
-    // Get pilot session data to check if this node corresponds to a pilot step
-    const { data: sessionData } = useGetPilotSessionDetail(
-      {
-        query: { sessionId: activeSessionId },
-      },
-      undefined,
-      {
-        enabled: !!activeSessionId,
-      },
-    );
-
     const isExecuting =
       data.metadata?.status === 'executing' || data.metadata?.status === 'waiting';
 
@@ -282,20 +269,16 @@ export const SkillResponseNode = memo(
     });
 
     const nodeStyle = useMemo(
-      () => (isPreview ? { width: NODE_WIDTH, height: 214 } : NODE_SIDE_CONFIG),
+      () =>
+        isPreview
+          ? { width: NODE_WIDTH, height: 214 }
+          : { width: 'auto', height: 'auto', maxWidth: 320, maxHeight: 300 },
       [isPreview],
     );
 
     const { t } = useTranslation();
 
     const { title, metadata, entityId } = data ?? {};
-
-    // Find current node's corresponding pilot step
-    const currentPilotStep = useMemo(() => {
-      if (!sessionData?.data?.steps || !entityId) return null;
-
-      return sessionData.data.steps.find((step) => step.entityId === entityId);
-    }, [sessionData, entityId]);
 
     const { getConnectionInfo } = useGetNodeConnectFromDragCreateInfo();
     const { data: variables } = useVariablesManagement(canvasId);
@@ -305,6 +288,7 @@ export const SkillResponseNode = memo(
     const currentSkill = actionMeta || selectedSkill;
 
     const { startPolling, resetFailedState } = useActionPolling();
+    const { fetchActionResult } = useFetchActionResult();
     const { result, isStreaming, removeStreamResult, removeActionResult } =
       useActionResultStoreShallow((state) => ({
         result: state.resultMap[entityId],
@@ -363,12 +347,6 @@ export const SkillResponseNode = memo(
       }
     }, [id, data?.editedTitle]);
 
-    // Use pilot recovery hook for pilot steps
-    const { recoverSteps } = usePilotRecovery({
-      canvasId: canvasId || '',
-      sessionId: activeSessionId || '',
-    });
-
     useEffect(() => {
       // Don't start polling in readonly mode (e.g., run-detail page)
       if (readonly) return;
@@ -408,22 +386,40 @@ export const SkillResponseNode = memo(
       readonly,
     ]);
 
-    // Listen to pilot step status changes and sync with node status
+    // In readonly mode, fetch latest result once on mount to ensure node state is up-to-date
+    // Use ref to track if we've already fetched for this entityId to prevent duplicate requests
+    const fetchedEntityIdRef = useRef<string | null>(null);
     useEffect(() => {
-      if (currentPilotStep?.status && currentPilotStep.status !== data?.metadata?.status) {
-        console.log(
-          `[Pilot Step Sync] Updating node ${id} status from ${data?.metadata?.status} to ${currentPilotStep.status}`,
-        );
-
-        setNodeData(id, {
-          ...data,
-          metadata: {
-            ...data?.metadata,
-            status: currentPilotStep.status,
-          },
-        });
+      // Only fetch in readonly mode, when entityId exists, no shareId, and we haven't fetched for this entityId
+      if (!readonly || !entityId || shareId || fetchedEntityIdRef.current === entityId) {
+        return;
       }
-    }, [currentPilotStep?.status, data, id, setNodeData]);
+
+      // Check if result already exists and is up-to-date
+      const nodeVersion = data?.metadata?.version;
+      const resultVersion = result?.version;
+
+      // Only fetch if:
+      // 1. No result exists (need to fetch to get the latest state), OR
+      // 2. Both versions are defined but don't match (node might have newer version, need to verify)
+      // Skip fetch if result exists and versions match (already up-to-date)
+      // Skip fetch if nodeVersion is undefined but result exists (let sync useEffect handle it)
+      const shouldFetch =
+        !result ||
+        (nodeVersion !== undefined && resultVersion !== undefined && resultVersion !== nodeVersion);
+
+      if (shouldFetch) {
+        fetchedEntityIdRef.current = entityId;
+        // Fetch once when component mounts in readonly mode
+        fetchActionResult(entityId, {
+          silent: true,
+          nodeToUpdate: { id, data } as any,
+        });
+      } else {
+        // Mark as fetched even if we skipped, to avoid unnecessary checks
+        fetchedEntityIdRef.current = entityId;
+      }
+    }, [readonly, entityId, shareId, fetchActionResult, id, result, data?.metadata?.version]);
 
     const skill = {
       name: currentSkill?.name || 'commonQnA',
@@ -436,46 +432,6 @@ export const SkillResponseNode = memo(
     const isSourceConnected = edges?.some((edge) => edge.source === id);
 
     const { invokeAction } = useInvokeAction({ source: 'skill-response-node' });
-
-    // Pilot recovery mode
-    const handlePilotRecovery = useCallback(async () => {
-      if (!currentPilotStep?.stepId || !activeSessionId) return;
-
-      message.info(
-        t('canvas.skillResponse.startPilotRecovery', {
-          defaultValue: 'Starting pilot recovery...',
-        }),
-      );
-
-      try {
-        // 使用 usePilotRecovery hook
-        await recoverSteps([currentPilotStep]);
-
-        // 前端状态更新
-        setNodeData(id, {
-          ...data,
-          contentPreview: '',
-          metadata: {
-            ...data?.metadata,
-            status: 'waiting',
-            version: (data?.metadata?.version || 0) + 1,
-          },
-        });
-
-        message.success(
-          t('canvas.skillResponse.pilotRecoveryStarted', {
-            defaultValue: 'Pilot recovery started successfully',
-          }),
-        );
-      } catch (error) {
-        console.error('Pilot recovery failed:', error);
-        message.error(
-          t('canvas.skillResponse.pilotRecoveryFailed', {
-            defaultValue: 'Pilot recovery failed',
-          }),
-        );
-      }
-    }, [currentPilotStep, activeSessionId, recoverSteps, data, id, setNodeData, t]);
 
     // Direct rerun mode (original logic)
     const handleDirectRerun = useCallback(() => {
@@ -500,7 +456,7 @@ export const SkillResponseNode = memo(
       });
 
       const query = data?.metadata?.query ?? '';
-      const { llmInputQuery } = processQuery(query, {
+      const { llmInputQuery, referencedVariables } = processQuery(query, {
         replaceVars: true,
         variables,
       });
@@ -515,7 +471,7 @@ export const SkillResponseNode = memo(
           selectedToolsets: purgeToolsets(data?.metadata?.selectedToolsets),
           version: nextVersion,
           modelInfo: data?.metadata?.modelInfo,
-          workflowVariables: variables,
+          workflowVariables: referencedVariables,
         },
         {
           entityType: 'canvas',
@@ -552,25 +508,9 @@ export const SkillResponseNode = memo(
         nodeId: id,
       });
 
-      // 判断是否为 pilot step
-      if (currentPilotStep?.stepId && activeSessionId) {
-        // 使用 pilot recovery 模式
-        handlePilotRecovery();
-      } else {
-        // 使用原有的直接重试模式
-        handleDirectRerun();
-      }
-    }, [
-      readonly,
-      data?.metadata?.status,
-      t,
-      currentPilotStep,
-      activeSessionId,
-      handlePilotRecovery,
-      handleDirectRerun,
-      canvasId,
-      id,
-    ]);
+      // 使用直接重试模式
+      handleDirectRerun();
+    }, [readonly, data?.metadata?.status, t, handleDirectRerun, canvasId, id]);
 
     const { deleteNode } = useDeleteNode();
     const { duplicateNode } = useDuplicateNode();

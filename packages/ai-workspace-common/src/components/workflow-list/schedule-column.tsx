@@ -59,6 +59,7 @@ export const ScheduleColumn = memo(
     );
     const [weekdays, setWeekdays] = useState<number[]>(existingConfig?.weekdays || [1]);
     const [monthDays, setMonthDays] = useState<number[]>(existingConfig?.monthDays || [1]);
+    const [hours, setHours] = useState<number>(existingConfig?.hours || 1);
 
     // API mutation
     const updateScheduleMutation = useUpdateSchedule();
@@ -80,14 +81,14 @@ export const ScheduleColumn = memo(
         if (newOpen) {
           // Check quota before opening for disabled schedules
           // If schedule is disabled and user already reached quota, show modal instead
-          if (!schedule?.isEnabled && totalEnabledSchedules >= scheduleQuota) {
+          /*if (!schedule?.isEnabled && totalEnabledSchedules >= scheduleQuota) {
             if (planType === 'free') {
               setCreditInsufficientModalVisible(true, undefined, 'schedule');
             } else {
               setScheduleLimitModalVisible(true);
             }
             return; // Don't open popover
-          }
+          }*/
 
           const config = parseScheduleConfig(schedule?.scheduleConfig);
           setIsEnabled(schedule?.isEnabled ?? false);
@@ -106,21 +107,6 @@ export const ScheduleColumn = memo(
       async (enabled: boolean) => {
         if (!schedule?.scheduleId || !timeValue) return;
 
-        // Check quota when trying to enable
-        if (enabled && !schedule?.isEnabled) {
-          // This schedule is not currently enabled, check if quota allows enabling
-          if (totalEnabledSchedules >= scheduleQuota) {
-            if (planType === 'free') {
-              // Free user: show credit insufficient modal
-              setCreditInsufficientModalVisible(true, undefined, 'schedule');
-            } else {
-              // Paid user: show schedule limit reached modal
-              setScheduleLimitModalVisible(true);
-            }
-            return;
-          }
-        }
-
         setIsEnabled(enabled);
 
         try {
@@ -131,11 +117,12 @@ export const ScheduleColumn = memo(
             time: timeStr,
             ...(frequency === 'weekly' && { weekdays }),
             ...(frequency === 'monthly' && { monthDays }),
+            ...(frequency === 'hourly' && { hours }),
           };
 
           const cronExpression = generateCronExpression(scheduleConfig);
 
-          await updateScheduleMutation.mutateAsync({
+          const result = await updateScheduleMutation.mutateAsync({
             body: {
               scheduleId: schedule.scheduleId,
               cronExpression,
@@ -144,6 +131,11 @@ export const ScheduleColumn = memo(
               isEnabled: enabled,
             },
           });
+
+          // Check if the API returned an error
+          if ((result as any)?.error || !(result?.data as any)?.success) {
+            throw new Error((result as any)?.error?.message || 'Failed to update schedule');
+          }
 
           message.success(
             enabled
@@ -168,10 +160,6 @@ export const ScheduleColumn = memo(
         updateScheduleMutation,
         onScheduleChange,
         t,
-        totalEnabledSchedules,
-        scheduleQuota,
-        planType,
-        setCreditInsufficientModalVisible,
       ],
     );
 
@@ -187,6 +175,7 @@ export const ScheduleColumn = memo(
         currentTimeValue: dayjs.Dayjs,
         currentWeekdays: number[],
         currentMonthDays: number[],
+        currentHours: number,
       ) => {
         if (!schedule?.scheduleId || !currentTimeValue) return;
 
@@ -198,11 +187,12 @@ export const ScheduleColumn = memo(
             time: timeStr,
             ...(currentFrequency === 'weekly' && { weekdays: currentWeekdays }),
             ...(currentFrequency === 'monthly' && { monthDays: currentMonthDays }),
+            ...(currentFrequency === 'hourly' && { hours: currentHours }),
           };
 
           const cronExpression = generateCronExpression(scheduleConfig);
 
-          await updateScheduleMutation.mutateAsync({
+          const result = await updateScheduleMutation.mutateAsync({
             body: {
               scheduleId: schedule.scheduleId,
               cronExpression,
@@ -211,6 +201,11 @@ export const ScheduleColumn = memo(
               isEnabled,
             },
           });
+
+          // Check if the API returned an error
+          if ((result as any)?.error || !(result?.data as any)?.success) {
+            throw new Error((result as any)?.error?.message || 'Failed to update schedule');
+          }
 
           onScheduleChange?.();
         } catch (error) {
@@ -225,33 +220,41 @@ export const ScheduleColumn = memo(
     const handleFrequencyChange = useCallback(
       (newFrequency: ScheduleFrequency) => {
         setFrequency(newFrequency);
-        debouncedSaveConfig(newFrequency, timeValue, weekdays, monthDays);
+        debouncedSaveConfig(newFrequency, timeValue, weekdays, monthDays, hours);
       },
-      [weekdays, monthDays, timeValue, debouncedSaveConfig],
+      [weekdays, monthDays, hours, timeValue, debouncedSaveConfig],
     );
 
     const handleTimeChange = useCallback(
       (newTime: dayjs.Dayjs) => {
         setTimeValue(newTime);
-        debouncedSaveConfig(frequency, newTime, weekdays, monthDays);
+        debouncedSaveConfig(frequency, newTime, weekdays, monthDays, hours);
       },
-      [frequency, weekdays, monthDays, debouncedSaveConfig],
+      [frequency, weekdays, monthDays, hours, debouncedSaveConfig],
     );
 
     const handleWeekdaysChange = useCallback(
       (newWeekdays: number[]) => {
         setWeekdays(newWeekdays);
-        debouncedSaveConfig(frequency, timeValue, newWeekdays, monthDays);
+        debouncedSaveConfig(frequency, timeValue, newWeekdays, monthDays, hours);
       },
-      [frequency, timeValue, monthDays, debouncedSaveConfig],
+      [frequency, timeValue, monthDays, hours, debouncedSaveConfig],
     );
 
     const handleMonthDaysChange = useCallback(
       (newMonthDays: number[]) => {
         setMonthDays(newMonthDays);
-        debouncedSaveConfig(frequency, timeValue, weekdays, newMonthDays);
+        debouncedSaveConfig(frequency, timeValue, weekdays, newMonthDays, hours);
       },
-      [frequency, timeValue, weekdays, debouncedSaveConfig],
+      [frequency, timeValue, weekdays, hours, debouncedSaveConfig],
+    );
+
+    const handleHoursChange = useCallback(
+      (newHours: number) => {
+        setHours(newHours);
+        debouncedSaveConfig(frequency, timeValue, weekdays, monthDays, newHours);
+      },
+      [frequency, timeValue, weekdays, monthDays, debouncedSaveConfig],
     );
 
     // Schedule display for badge
@@ -268,7 +271,9 @@ export const ScheduleColumn = memo(
             ? t('schedule.weekly')
             : config?.type === 'monthly'
               ? t('schedule.monthly')
-              : t('schedule.title');
+              : config?.type === 'hourly'
+                ? t('schedule.hourly')
+                : t('schedule.title');
       const enabled = schedule.isEnabled ?? false;
 
       return {
@@ -287,9 +292,21 @@ export const ScheduleColumn = memo(
 
       return (
         <div className="flex items-center gap-1 bg-refly-bg-control-z0 rounded-[6px] px-2 h-[26px]">
+          <style>
+            {`
+          .schedule-timepicker-popup .ant-picker-time-panel {
+            width: 188px !important;
+            min-width: 188px !important;
+          }
+          .schedule-timepicker-popup .ant-picker-dropdown {
+            width: 188px !important;
+            min-width: 188px !important;
+          }
+        `}
+          </style>
           <span className="text-xs font-normal leading-[18px] text-refly-text-0">{label}</span>
           <span
-            className={`px-1 py-0.5 flex items-center text-[9px] font-bold leading-[11px] rounded-sm ${
+            className={`px-1 py-0.5 flex items-center text-[9px] font-bold leading-[11px] rounded ${
               enabled
                 ? 'bg-refly-primary-default text-refly-bg-body-z0'
                 : 'bg-refly-fill-hover text-refly-text-3'
@@ -318,11 +335,13 @@ export const ScheduleColumn = memo(
               timeValue={timeValue}
               weekdays={weekdays}
               monthDays={monthDays}
+              hours={hours}
               onEnabledChange={handleEnabledChange}
               onFrequencyChange={handleFrequencyChange}
               onTimeChange={handleTimeChange}
               onWeekdaysChange={handleWeekdaysChange}
               onMonthDaysChange={handleMonthDaysChange}
+              onHoursChange={handleHoursChange}
               onClose={handleClose}
               creditCost={creditUsageData?.data?.total}
               isCreditLoading={isCreditUsageLoading}
@@ -333,16 +352,21 @@ export const ScheduleColumn = memo(
                   setCreditInsufficientModalVisible(true, undefined, 'schedule');
                 }, 100);
               }}
+              totalEnabledSchedules={totalEnabledSchedules}
+              scheduleQuota={scheduleQuota}
+              planType={planType}
+              setCreditInsufficientModalVisible={setCreditInsufficientModalVisible}
+              setScheduleLimitModalVisible={setScheduleLimitModalVisible}
             />
           }
           trigger="click"
           open={open}
           onOpenChange={handleOpenChange}
-          placement="bottomLeft"
+          placement="bottom"
           overlayClassName="schedule-popover"
         >
           <div
-            className="flex items-center justify-center gap-1 cursor-pointer hover:opacity-70 transition-opacity select-none"
+            className="flex items-center gap-1 cursor-pointer hover:opacity-70 transition-opacity select-none"
             onClick={(e) => e.stopPropagation()}
           >
             {renderBadge()}

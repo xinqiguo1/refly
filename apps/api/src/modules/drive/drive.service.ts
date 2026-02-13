@@ -1,4 +1,5 @@
-import { Inject, Injectable, NotFoundException, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, NotFoundException, OnModuleInit, Optional } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 import { ModuleRef } from '@nestjs/core';
 import { PinoLogger } from 'nestjs-pino';
 import mime from 'mime';
@@ -10,6 +11,8 @@ import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../common/redis.service';
 import { Trace, getCurrentSpan, getTracer } from '@refly/observability';
 import { SpanStatusCode } from '@opentelemetry/api';
+import { LambdaService } from '../lambda/lambda.service';
+import { LambdaJobRecord } from '../lambda/lambda.dto';
 import {
   UpsertDriveFileRequest,
   DeleteDriveFileRequest,
@@ -19,6 +22,9 @@ import {
   DriveFile,
   DriveFileCategory,
   DriveFileSource,
+  StartExportJobRequest,
+  ExportJob,
+  ExportJobStatus,
 } from '@refly/openapi-schema';
 import { Prisma, DriveFile as DriveFileModel } from '@prisma/client';
 import {
@@ -34,20 +40,30 @@ import {
   DriveFileNotFoundError,
   DocumentNotFoundError,
   FileTooLargeError,
+  PresignNotSupportedError,
+  InvalidContentTypeError,
+  UploadSizeMismatchError,
+  UploadExpiredError,
 } from '@refly/errors';
 import { ObjectStorageService, OSS_INTERNAL, OSS_EXTERNAL } from '../common/object-storage';
-import { streamToBuffer, streamToString } from '../../utils';
+import type { ObjectInfo } from '../common/object-storage/backend/interface';
+import { streamToBuffer } from '../../utils';
 import { driveFilePO2DTO } from './drive.dto';
 import { isEmbeddableLinkFile } from './drive.utils';
+import {
+  PRESIGNED_UPLOAD_EXPIRY,
+  PENDING_UPLOAD_REDIS_TTL,
+  PENDING_UPLOAD_CLEANUP_AGE,
+  MAX_CLI_UPLOAD_SIZE,
+  PENDING_UPLOAD_REDIS_PREFIX,
+  isContentTypeAllowed,
+} from './drive.constants';
 import path from 'node:path';
 import { ProviderService } from '../provider/provider.service';
 import { ParserFactory } from '../knowledge/parsers/factory';
 import { SubscriptionService } from '../subscription/subscription.service';
 import { readingTime } from 'reading-time-estimator';
 import { MiscService } from '../misc/misc.service';
-import { DocxParser } from '../knowledge/parsers/docx.parser';
-import { PdfParser } from '../knowledge/parsers/pdf.parser';
-import { ObjectInfo } from '../common/object-storage/backend/interface';
 
 export interface ExtendedUpsertDriveFileRequest extends UpsertDriveFileRequest {
   buffer?: Buffer;
@@ -79,6 +95,7 @@ export class DriveService implements OnModuleInit {
     private providerService: ProviderService,
     private moduleRef: ModuleRef,
     private miscService: MiscService,
+    @Optional() private lambdaService?: LambdaService,
   ) {
     this.logger.setContext(DriveService.name);
   }
@@ -598,7 +615,7 @@ export class DriveService implements OnModuleInit {
       }
 
       // Apply token-based truncation (head/tail preservation)
-      const maxTokens = this.config.get<number>('drive.maxContentTokens') || 25000;
+      const maxTokens = this.config.get<number>('drive.maxContentTokens') || 50000;
       const truncateStart = performance.now();
       const truncatedContent = truncateContent(content, maxTokens);
       this.logger.info(
@@ -643,79 +660,207 @@ export class DriveService implements OnModuleInit {
   }
 
   /**
-   * Load drive file content from cache or parse if not cached
+   * Check if content type is supported for Lambda parsing
    */
-  @Trace('drive.loadOrParseDriveFile')
-  private async loadOrParseDriveFile(user: User, driveFile: DriveFileModel): Promise<DriveFile> {
+  private isLambdaParsableContentType(contentType: string): boolean {
+    const supportedTypes = [
+      'application/pdf',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // docx
+      'application/epub+zip',
+      'text/html',
+    ];
+    return supportedTypes.includes(contentType);
+  }
+
+  /**
+   * Parse file content via Lambda service
+   */
+  @Trace('drive.parseViaLambda')
+  private async parseViaLambda(
+    user: User,
+    driveFile: DriveFileModel,
+    storageKey: string,
+  ): Promise<DriveFile> {
     const { fileId, type: contentType } = driveFile;
     const tracer = getTracer();
-    getCurrentSpan()?.setAttributes({ 'file.id': fileId, 'file.type': contentType });
 
-    this.logger.info(`Loading or parsing drive file ${fileId}, contentType: ${contentType}`);
+    // S3 input bucket (where source files are stored)
+    const inputBucket = this.config.get<string>('lambda.s3.inputBucket');
 
-    // Step 1: Try to load from cache
-    const cache = await this.prisma.driveFileParseCache.findUnique({
-      where: { fileId },
+    // Output bucket for Lambda results
+    const outputBucket = this.config.get<string>('lambda.s3.bucket');
+
+    // Dispatch to Lambda
+    const lambdaJob = await this.lambdaService!.dispatchDocumentIngest({
+      uid: user.uid,
+      fileId,
+      s3Input: {
+        bucket: inputBucket,
+        key: storageKey,
+      },
+      outputBucket,
+      contentType,
+      name: driveFile.name,
+      options: {
+        extractImages: false,
+        outputFormat: 'markdown',
+      },
     });
 
-    if (cache?.parseStatus === 'success') {
-      return tracer
-        .startActiveSpan('drive.loadFromCache', async (span) => {
-          try {
-            const stream = await this.internalOss.getObject(cache.contentStorageKey);
-            let content = await streamToBuffer(stream).then((b) => b.toString('utf8'));
+    // Mark cache as processing
+    await this.prisma.driveFileParseCache.upsert({
+      where: { fileId },
+      create: {
+        fileId,
+        uid: user.uid,
+        contentStorageKey: '',
+        contentType,
+        parser: 'lambda',
+        parseStatus: 'processing',
+        metadata: JSON.stringify({ lambdaJobId: lambdaJob.jobId }),
+      },
+      update: {
+        parser: 'lambda',
+        parseStatus: 'processing',
+        parseError: null,
+        metadata: JSON.stringify({ lambdaJobId: lambdaJob.jobId }),
+        updatedAt: new Date(),
+      },
+    });
 
-            const maxTokens = this.config.get<number>('drive.maxContentTokens') || 25000;
-            const originalLen = content.length;
-            const truncateStart = performance.now();
-            content = truncateContent(content, maxTokens);
-            this.logger.info(
-              `[loadOrParseDriveFile] truncateContent from cache: fileId=${fileId}, len=${originalLen}, time=${(performance.now() - truncateStart).toFixed(2)}ms`,
-            );
+    // Poll for result with timeout
+    const pollIntervalMs = this.config.get<number>('lambda.resultPolling.intervalMs') || 1000;
+    const maxRetries = this.config.get<number>('lambda.resultPolling.maxRetries') || 300;
 
-            span.setAttributes({ 'cache.hit': true, 'content.length': content.length });
-            span.end();
-            return { ...this.toDTO(driveFile), content };
-          } catch (error) {
-            this.logger.warn(`Cache read failed for ${fileId}, will re-parse:`, error);
-            span.setAttributes({ 'cache.hit': false, 'cache.error': true });
-            span.end();
-            throw error; // Rethrow to continue to parse below
-          }
-        })
-        .catch(() => null); // Return null to continue parsing if cache fails
+    let retries = 0;
+    while (retries < maxRetries) {
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      retries++;
+
+      const { job, effectiveStatus } = await this.lambdaService!.getJobStatus(lambdaJob.jobId);
+
+      if (effectiveStatus === 'FAILED') {
+        const errorMsg = job?.error || 'Lambda processing failed';
+        this.logger.error(`Lambda job ${lambdaJob.jobId} failed: ${errorMsg}`);
+
+        await this.prisma.driveFileParseCache.update({
+          where: { fileId },
+          data: {
+            parseStatus: 'failed',
+            parseError: JSON.stringify({ message: errorMsg, lambdaJobId: lambdaJob.jobId }),
+            updatedAt: new Date(),
+          },
+        });
+
+        // Lambda failed - guide to use sandbox
+        throw new FileTooLargeError(
+          'File parsing failed. Use execute_code tool to process this file.',
+        );
+      }
+
+      if (effectiveStatus === 'COMPLETED' || effectiveStatus === 'PENDING_PERSIST') {
+        // Job completed, fetch the result
+        if (job?.storageKey) {
+          return tracer.startActiveSpan('drive.loadLambdaResult', async (span) => {
+            try {
+              // Use LambdaService to read from AWS S3 where Lambda writes output
+              // (internalOss points to local MinIO, not AWS S3)
+              let content = await this.lambdaService!.getJobOutputAsString(job.storageKey!);
+              if (!content) {
+                throw new Error(`Failed to read Lambda output from S3: ${job.storageKey}`);
+              }
+
+              // Process content - remove null characters
+              content = content.replace(/\0/g, '');
+              content = this.normalizeWhitespace(content);
+
+              const maxTokens = this.config.get<number>('drive.maxContentTokens') || 50000;
+              const truncatedContent = truncateContent(content, maxTokens);
+
+              // Check if content was truncated
+              const isTruncated = truncatedContent.includes('[... truncated ...]');
+
+              // Save to cache
+              const contentStorageKey = `drive-parsed/${user.uid}/${fileId}.txt`;
+              await this.internalOss.putObject(contentStorageKey, truncatedContent);
+
+              const jobMetadata = job.metadata ? JSON.parse(job.metadata) : {};
+              const wordCount = jobMetadata.wordCount || readingTime(truncatedContent).words;
+
+              // Store truncation status in metadata
+              const cacheMetadata = {
+                lambdaJobId: lambdaJob.jobId,
+                truncated: isTruncated,
+              };
+
+              await this.prisma.driveFileParseCache.update({
+                where: { fileId },
+                data: {
+                  contentStorageKey,
+                  parser: 'lambda',
+                  numPages: jobMetadata.pageCount || null,
+                  wordCount,
+                  parseStatus: 'success',
+                  parseError: null,
+                  metadata: JSON.stringify(cacheMetadata),
+                  updatedAt: new Date(),
+                },
+              });
+
+              span.setAttributes({
+                'lambda.jobId': lambdaJob.jobId,
+                'content.length': truncatedContent.length,
+              });
+              span.end();
+
+              return { ...this.toDTO(driveFile), content: truncatedContent };
+            } catch (error) {
+              span.setStatus({ code: SpanStatusCode.ERROR, message: (error as Error).message });
+              span.end();
+              throw error;
+            }
+          });
+        }
+      }
+
+      // Still processing, continue polling
     }
 
-    // Check file size limit before downloading - large files should use execute_code tool
-    const storageKey = driveFile.storageKey ?? this.generateStorageKey(user, driveFile);
-    const maxFileSizeKB = this.config.get<number>('drive.maxParseFileSizeKB') || 512;
-    const maxFileSizeBytes = maxFileSizeKB * 1024;
+    // Timeout reached
+    this.logger.error(`Lambda job ${lambdaJob.jobId} timed out after ${maxRetries} retries`);
+    await this.prisma.driveFileParseCache.update({
+      where: { fileId },
+      data: {
+        parseStatus: 'failed',
+        parseError: JSON.stringify({
+          message: 'Lambda processing timeout',
+          lambdaJobId: lambdaJob.jobId,
+        }),
+        updatedAt: new Date(),
+      },
+    });
 
-    let fileStat: ObjectInfo | undefined;
-    try {
-      fileStat = await this.internalOss.statObject(storageKey);
-    } catch (error) {
-      this.logger.error(`Failed to stat drive file ${fileId}: ${(error as Error)?.message}`);
-      throw new DriveFileNotFoundError(`Drive file not found: ${fileId}`);
-    }
+    // Lambda timeout - guide to use sandbox
+    throw new FileTooLargeError(
+      'File parsing timeout. Use execute_code tool to process this file.',
+    );
+  }
 
-    if (fileStat && fileStat.size > maxFileSizeBytes) {
-      const fileSizeKB = Math.round(fileStat.size / 1024);
-      this.logger.info(
-        `Drive file ${fileId} exceeds size limit: ${fileSizeKB}KB > ${maxFileSizeKB}KB`,
-      );
-      throw new FileTooLargeError(
-        'File exceeds size limit. Use execute_code tool to process this file.',
-        fileSizeKB,
-      );
-    }
+  /**
+   * Parse file content locally (original parsing logic)
+   */
+  @Trace('drive.parseLocally')
+  private async parseLocally(
+    user: User,
+    driveFile: DriveFileModel,
+    storageKey: string,
+  ): Promise<DriveFile> {
+    const { fileId, type: contentType } = driveFile;
+    const tracer = getTracer();
 
-    // Step 2: No cache found, perform parsing
-    getCurrentSpan()?.setAttribute('cache.hit', false);
     try {
       // Load file from storage
       const fileBuffer = await tracer.startActiveSpan('drive.loadFromOSS', async (span) => {
-        const storageKey = driveFile.storageKey ?? this.generateStorageKey(user, driveFile);
         const fileStream = await this.internalOss.getObject(storageKey);
         const buffer = await streamToBuffer(fileStream);
         span.setAttribute('file.size', buffer.length);
@@ -787,16 +932,28 @@ export class DriveService implements OnModuleInit {
         return r;
       });
 
-      // Process and store content
-      let processedContent = result.content?.replace(/x00/g, '') || '';
+      let processedContent = result.content?.replace(/\0/g, '') || '';
+
+      // Normalize whitespace
       processedContent = this.normalizeWhitespace(processedContent);
 
-      const maxTokens = this.config.get<number>('drive.maxContentTokens') || 25000;
+      const maxTokens = this.config.get<number>('drive.maxContentTokens') || 50000;
       const truncateStart = performance.now();
       const truncatedContent = truncateContent(processedContent, maxTokens);
       this.logger.info(
-        `[loadOrParseDriveFile] truncateContent after parse: fileId=${fileId}, len=${processedContent.length}, time=${(performance.now() - truncateStart).toFixed(2)}ms`,
+        `[parseLocally] truncateContent after parse: fileId=${fileId}, len=${processedContent.length}, time=${(performance.now() - truncateStart).toFixed(2)}ms`,
       );
+
+      // Check if content was truncated - throw error to guide sandbox usage
+      const isTruncated = truncatedContent.includes('[... truncated ...]');
+      if (isTruncated) {
+        this.logger.info(
+          `Drive file ${fileId} content was truncated (${processedContent.length} chars), guiding to use sandbox`,
+        );
+        throw new FileTooLargeError(
+          'File content is too large for direct reading. Use execute_code tool to process this file.',
+        );
+      }
 
       const contentStorageKey = `drive-parsed/${user.uid}/${fileId}.txt`;
       await tracer.startActiveSpan('drive.saveToCache', async (span) => {
@@ -819,6 +976,7 @@ export class DriveService implements OnModuleInit {
           numPages: numPages ?? null,
           wordCount,
           parseStatus: 'success',
+          metadata: JSON.stringify({ truncated: false }),
         },
         update: {
           contentStorageKey,
@@ -827,6 +985,7 @@ export class DriveService implements OnModuleInit {
           wordCount,
           parseStatus: 'success',
           parseError: null,
+          metadata: JSON.stringify({ truncated: false }),
           updatedAt: new Date(),
         },
       });
@@ -848,7 +1007,7 @@ export class DriveService implements OnModuleInit {
       return { ...this.toDTO(driveFile), content: truncatedContent };
     } catch (error) {
       this.logger.error(
-        `Failed to parse drive file ${fileId}: ${JSON.stringify({ message: error.message })}`,
+        `Failed to parse drive file ${fileId}: ${JSON.stringify({ message: (error as Error).message })}`,
       );
 
       // Record failure status
@@ -861,11 +1020,11 @@ export class DriveService implements OnModuleInit {
           contentType,
           parser: '',
           parseStatus: 'failed',
-          parseError: JSON.stringify({ message: error.message }),
+          parseError: JSON.stringify({ message: (error as Error).message }),
         },
         update: {
           parseStatus: 'failed',
-          parseError: JSON.stringify({ message: error.message }),
+          parseError: JSON.stringify({ message: (error as Error).message }),
           updatedAt: new Date(),
         },
       });
@@ -874,6 +1033,136 @@ export class DriveService implements OnModuleInit {
       this.logger.info(`Returning fallback summary for ${fileId} due to parse failure`);
       return { ...this.toDTO(driveFile), content: driveFile.summary };
     }
+  }
+
+  /**
+   * Load drive file content from cache or parse if not cached
+   * Uses Lambda for parsing when enabled, falls back to local parsing otherwise
+   */
+  @Trace('drive.loadOrParseDriveFile')
+  private async loadOrParseDriveFile(user: User, driveFile: DriveFileModel): Promise<DriveFile> {
+    const { fileId, type: contentType } = driveFile;
+    const tracer = getTracer();
+    getCurrentSpan()?.setAttributes({ 'file.id': fileId, 'file.type': contentType });
+
+    this.logger.info(`Loading or parsing drive file ${fileId}, contentType: ${contentType}`);
+
+    // Step 1: Try to load from cache
+    const cache = await this.prisma.driveFileParseCache.findUnique({
+      where: { fileId },
+    });
+
+    if (cache?.parseStatus === 'success') {
+      // Check if content was truncated during parsing - guide to use sandbox
+      const cacheMetadata = cache.metadata ? JSON.parse(cache.metadata) : {};
+      if (cacheMetadata.truncated === true) {
+        this.logger.info(
+          `Drive file ${fileId} was truncated during parsing, guiding to use sandbox`,
+        );
+        throw new FileTooLargeError(
+          'File content was truncated due to size. Use execute_code tool to process this file for complete content.',
+        );
+      }
+
+      return tracer
+        .startActiveSpan('drive.loadFromCache', async (span) => {
+          try {
+            const stream = await this.internalOss.getObject(cache.contentStorageKey);
+            let content = await streamToBuffer(stream).then((b) => b.toString('utf8'));
+
+            const maxTokens = this.config.get<number>('drive.maxContentTokens') || 50000;
+            const originalLen = content.length;
+            const truncateStart = performance.now();
+            content = truncateContent(content, maxTokens);
+            this.logger.info(
+              `[loadOrParseDriveFile] truncateContent from cache: fileId=${fileId}, len=${originalLen}, time=${(performance.now() - truncateStart).toFixed(2)}ms`,
+            );
+
+            span.setAttributes({ 'cache.hit': true, 'content.length': content.length });
+            span.end();
+            return { ...this.toDTO(driveFile), content };
+          } catch (error) {
+            this.logger.warn(`Cache read failed for ${fileId}, will re-parse:`, error);
+            span.setAttributes({ 'cache.hit': false, 'cache.error': true });
+            span.end();
+            throw error; // Rethrow to continue to parse below
+          }
+        })
+        .catch(() => null); // Return null to continue parsing if cache fails
+    }
+
+    // Check if cache is still processing (Lambda job in progress)
+    if (cache?.parseStatus === 'processing') {
+      // Check for timeout (default: 5 minutes)
+      const timeoutMs = this.config.get<number>('lambda.parseTimeoutMs') || 5 * 60 * 1000;
+      const elapsed = Date.now() - new Date(cache.updatedAt).getTime();
+
+      if (elapsed < timeoutMs) {
+        const metadata = cache.metadata ? JSON.parse(cache.metadata) : {};
+        if (metadata.lambdaJobId && this.lambdaService) {
+          const { effectiveStatus } = await this.lambdaService.getJobStatus(metadata.lambdaJobId);
+          if (effectiveStatus === 'PROCESSING' || effectiveStatus === 'PENDING') {
+            // Return summary while processing
+            return { ...this.toDTO(driveFile), content: driveFile.summary || 'Processing...' };
+          }
+        }
+      } else {
+        // Timeout exceeded, mark as stale and allow re-parsing
+        this.logger.warn({ fileId, elapsed, timeoutMs }, 'Lambda parsing timeout, will retry');
+      }
+    }
+
+    // Get file storage key and stat
+    const storageKey = driveFile.storageKey ?? this.generateStorageKey(user, driveFile);
+
+    // Check file size limit before downloading - large files should use execute_code tool
+    const maxFileSizeKB = this.config.get<number>('drive.maxParseFileSizeKB') || 512;
+    const maxFileSizeBytes = maxFileSizeKB * 1024;
+
+    let fileStat: ObjectInfo | undefined;
+    try {
+      fileStat = await this.internalOss.statObject(storageKey);
+    } catch (error) {
+      this.logger.error(`Failed to stat drive file ${fileId}: ${(error as Error)?.message}`);
+      throw new DriveFileNotFoundError(`Drive file not found: ${fileId}`);
+    }
+
+    if (fileStat && fileStat.size > maxFileSizeBytes) {
+      const fileSizeKB = Math.round(fileStat.size / 1024);
+      this.logger.info(
+        `Drive file ${fileId} exceeds size limit: ${fileSizeKB}KB > ${maxFileSizeKB}KB`,
+      );
+      throw new FileTooLargeError(
+        'File exceeds size limit. Use execute_code tool to process this file.',
+        fileSizeKB,
+      );
+    }
+
+    // Step 2: No cache found, perform parsing
+    getCurrentSpan()?.setAttribute('cache.hit', false);
+
+    // Small files (≤5KB) can be parsed locally for faster response
+    const smallFileSizeKB = this.config.get<number>('drive.smallFileSizeKB') || 5;
+    const smallFileSizeBytes = smallFileSizeKB * 1024;
+
+    if (fileStat && fileStat.size <= smallFileSizeBytes) {
+      getCurrentSpan()?.setAttribute('parse.method', 'local-small');
+      return this.parseLocally(user, driveFile, storageKey);
+    }
+
+    // Check if Lambda is enabled and service is available
+    const lambdaEnabled = this.config.get<boolean>('lambda.enabled') !== false;
+    const useLambda =
+      lambdaEnabled && this.lambdaService && this.isLambdaParsableContentType(contentType);
+
+    if (useLambda) {
+      getCurrentSpan()?.setAttribute('parse.method', 'lambda');
+      return this.parseViaLambda(user, driveFile, storageKey);
+    }
+
+    // Fallback to local parsing for unsupported Lambda content types
+    getCurrentSpan()?.setAttribute('parse.method', 'local');
+    return this.parseLocally(user, driveFile, storageKey);
   }
 
   /**
@@ -961,7 +1250,7 @@ export class DriveService implements OnModuleInit {
           const driveStorageKey = this.generateStorageKey(user, file);
 
           try {
-            const expiry = Number(this.config.get<number>('drive.presignExpiry') ?? 300);
+            const expiry = Number(this.config.get<number>('drive.presignExpiry') ?? 3600);
             const signedUrl = await this.internalOss.presignedGetObject(driveStorageKey, expiry);
             return signedUrl;
           } catch (error) {
@@ -1024,6 +1313,19 @@ export class DriveService implements OnModuleInit {
     const createdFiles = await this.prisma.driveFile.createManyAndReturn({
       data: driveFilesData,
     });
+
+    // Trigger async parsing for each file (fire-and-forget)
+    for (let i = 0; i < createdFiles.length; i++) {
+      const file = createdFiles[i];
+      const req = processedRequests[i];
+      this.triggerAsyncParse(user, {
+        fileId: file.fileId,
+        type: file.type,
+        storageKey: req.driveStorageKey,
+        name: file.name,
+      }).catch(() => {});
+    }
+
     return createdFiles.map((file) => this.toDTO(file));
   }
 
@@ -1068,7 +1370,158 @@ export class DriveService implements OnModuleInit {
     const createdFile = await this.prisma.driveFile.create({
       data: createData,
     });
+
+    // Trigger async parsing if supported (fire-and-forget)
+    // Temporarily disabled - Lambda parsing not needed for file creation
+    // this.triggerAsyncParse(user, {
+    //   fileId: createdFile.fileId,
+    //   type: createdFile.type,
+    //   storageKey: processedReq.driveStorageKey,
+    //   name: createdFile.name,
+    // }).catch(() => {});
+
     return this.toDTO(createdFile);
+  }
+
+  /**
+   * Upload a file and create a drive file record with compensating transaction.
+   * If DB creation fails, the uploaded object is deleted from storage.
+   * @param user - User performing the upload
+   * @param file - Multer file object
+   * @param canvasId - Canvas ID to associate the file with
+   * @returns Created drive file DTO
+   */
+  async uploadAndCreateFile(
+    user: User,
+    file: Express.Multer.File,
+    canvasId: string,
+  ): Promise<DriveFile> {
+    if (!canvasId) {
+      throw new ParamsError('Canvas ID is required for upload');
+    }
+
+    // Validate canvas exists and user has access
+    const canvas = await this.prisma.canvas.findFirst({
+      where: { canvasId, uid: user.uid, deletedAt: null },
+    });
+    if (!canvas) {
+      throw new DocumentNotFoundError(`Canvas not found: ${canvasId}`);
+    }
+
+    // Generate file ID and storage key
+    const fileId = genDriveFileID();
+    const storageKey = this.generateStorageKey(user, {
+      canvasId,
+      name: `${fileId}-${file.originalname}`,
+    });
+
+    // Determine content type
+    const contentType =
+      file.mimetype ||
+      getSafeMimeType(file.originalname, mime.getType(file.originalname)) ||
+      'application/octet-stream';
+
+    // Upload to object storage
+    const headers: Record<string, string> = {};
+    const formattedContentType = this.appendUtf8CharsetIfNeeded(contentType);
+    if (formattedContentType) {
+      headers['Content-Type'] = formattedContentType;
+    }
+    await this.internalOss.putObject(storageKey, file.buffer, headers);
+
+    // Create DB record with compensating delete on failure
+    try {
+      const createdFile = await this.prisma.driveFile.create({
+        data: {
+          fileId,
+          uid: user.uid,
+          canvasId,
+          name: file.originalname,
+          type: contentType,
+          size: BigInt(file.size),
+          storageKey,
+          source: 'manual',
+          scope: 'present',
+          category: getFileCategory(contentType),
+        },
+      });
+
+      return this.toDTO(createdFile);
+    } catch (dbError) {
+      // Compensating transaction: delete uploaded object
+      this.logger.error(`DB create failed, cleaning up storageKey: ${storageKey}`, dbError);
+      await this.internalOss.removeObject(storageKey).catch((cleanupErr) => {
+        this.logger.error(`Failed to cleanup orphan file: ${storageKey}`, cleanupErr);
+      });
+      throw dbError;
+    }
+  }
+
+  /**
+   * Trigger async Lambda parsing for supported file types
+   * Silently returns if type not supported or on error
+   */
+  private async triggerAsyncParse(
+    user: User,
+    driveFile: { fileId: string; type: string; storageKey: string; name: string },
+  ): Promise<void> {
+    // Check if Lambda is enabled and service is available
+    const lambdaEnabled = this.config.get<boolean>('lambda.enabled') !== false;
+    if (!lambdaEnabled || !this.lambdaService) {
+      return;
+    }
+
+    // Check if content type is supported for Lambda parsing
+    if (!this.isLambdaParsableContentType(driveFile.type)) {
+      return;
+    }
+
+    try {
+      const inputBucket = this.config.get<string>('lambda.s3.inputBucket');
+      const outputBucket = this.config.get<string>('lambda.s3.bucket');
+
+      const lambdaJob = await this.lambdaService.dispatchDocumentIngest({
+        uid: user.uid,
+        fileId: driveFile.fileId,
+        s3Input: {
+          bucket: inputBucket,
+          key: driveFile.storageKey,
+        },
+        outputBucket,
+        contentType: driveFile.type,
+        name: driveFile.name,
+      });
+
+      // Create processing cache record to prevent duplicate parsing
+      await this.prisma.driveFileParseCache.upsert({
+        where: { fileId: driveFile.fileId },
+        create: {
+          fileId: driveFile.fileId,
+          uid: user.uid,
+          contentStorageKey: '',
+          contentType: driveFile.type,
+          parser: 'lambda',
+          parseStatus: 'processing',
+          metadata: JSON.stringify({ lambdaJobId: lambdaJob.jobId }),
+        },
+        update: {
+          parseStatus: 'processing',
+          metadata: JSON.stringify({ lambdaJobId: lambdaJob.jobId }),
+          updatedAt: new Date(),
+        },
+      });
+
+      this.logger.info(
+        { fileId: driveFile.fileId, type: driveFile.type, jobId: lambdaJob.jobId },
+        'Triggered async parse for uploaded file',
+      );
+    } catch (error) {
+      // Silently ignore errors - async parsing is best-effort
+      this.logger.warn(
+        { fileId: driveFile.fileId, error: (error as Error).message },
+        'Failed to trigger async parse',
+      );
+    }
   }
 
   /**
@@ -1806,6 +2259,52 @@ export class DriveService implements OnModuleInit {
       throw new ParamsError('Document ID is required');
     }
 
+    // For markdown format, handle locally (just return raw content with title)
+    // Lambda document-render only supports 'pdf' and 'docx'
+    if (format === 'markdown') {
+      return this.exportDocumentAsMarkdown(user, fileId);
+    }
+
+    // For pdf/docx, use Lambda
+    const lambdaEnabled = this.config.get<boolean>('lambda.enabled') !== false;
+    if (!lambdaEnabled || !this.lambdaService) {
+      throw new ParamsError('Lambda service is not available for document export');
+    }
+
+    // Start export job via Lambda
+    const exportJob = await this.startExportJob(user, { fileId, format });
+
+    // Poll for completion
+    const pollIntervalMs = this.config.get<number>('lambda.resultPolling.intervalMs') || 1000;
+    const maxRetries = this.config.get<number>('lambda.resultPolling.maxRetries') || 300;
+
+    let retries = 0;
+    while (retries < maxRetries) {
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      retries++;
+
+      const { job, effectiveStatus } = await this.lambdaService.getJobStatus(exportJob.jobId);
+
+      if (effectiveStatus === 'FAILED') {
+        const errorMsg = job?.error || 'Export job failed';
+        this.logger.error(`Export job ${exportJob.jobId} failed: ${errorMsg}`);
+        throw new ParamsError(`Document export failed: ${errorMsg}`);
+      }
+
+      if (effectiveStatus === 'COMPLETED' || effectiveStatus === 'PENDING_PERSIST') {
+        const { data } = await this.downloadExportJobResult(user, exportJob.jobId);
+        return data;
+      }
+    }
+
+    throw new ParamsError('Export job timed out');
+  }
+
+  /**
+   * Export document as markdown (local processing)
+   * Simply returns the file content with title prefix
+   */
+  private async exportDocumentAsMarkdown(user: User, fileId: string): Promise<Buffer> {
     const doc = await this.prisma.driveFile.findFirst({
       where: {
         fileId,
@@ -1818,37 +2317,639 @@ export class DriveService implements OnModuleInit {
       throw new DocumentNotFoundError('Document not found');
     }
 
-    let content: string;
-    if (doc.storageKey) {
-      const contentStream = await this.internalOss.getObject(doc.storageKey);
-      content = await streamToString(contentStream);
+    if (!doc.storageKey) {
+      throw new ParamsError('Document has no content to export');
     }
 
-    // Process images in the document content
-    if (content) {
-      content = await this.miscService.processContentImages(content);
+    // Get file content from storage
+    const stream = await this.internalOss.getObject(doc.storageKey);
+    const buffer = await streamToBuffer(stream);
+    const content = buffer.toString('utf-8');
+
+    // Add title as markdown header
+    const title = doc.name?.replace(/\.[^/.]+$/, '') || 'Untitled';
+    const markdownContent = `# ${title}\n\n${content}`;
+
+    return Buffer.from(markdownContent, 'utf-8');
+  }
+
+  // ============================================================================
+  // Lambda Integration Methods
+  // ============================================================================
+
+  /**
+   * Pre-create a DriveFile record for async Lambda processing
+   * This creates a placeholder file record that will be updated when Lambda completes
+   *
+   * @param user - The user creating the file
+   * @param params - File creation parameters
+   * @returns The created DriveFile record with pending status
+   */
+  async preCreateDriveFileForLambda(
+    user: User,
+    params: {
+      canvasId: string;
+      name: string;
+      contentType: string;
+      source?: DriveFileSource;
+      resultId?: string;
+      resultVersion?: number;
+      variableId?: string;
+    },
+  ): Promise<DriveFile> {
+    const fileId = genDriveFileID();
+    const category = getFileCategory(params.contentType);
+
+    // Generate the expected storage key path
+    const storageKey = this.generateStorageKey(user, {
+      canvasId: params.canvasId,
+      name: params.name,
+    });
+
+    const driveFile = await this.prisma.driveFile.create({
+      data: {
+        fileId,
+        uid: user.uid,
+        canvasId: params.canvasId,
+        name: params.name,
+        type: params.contentType,
+        category,
+        source: params.source ?? 'agent',
+        scope: 'present',
+        storageKey,
+        size: BigInt(0), // Will be updated when Lambda completes
+        resultId: params.resultId,
+        resultVersion: params.resultVersion,
+        variableId: params.variableId,
+      },
+    });
+
+    this.logger.info(
+      `Pre-created DriveFile for Lambda processing: fileId=${fileId}, canvasId=${params.canvasId}`,
+    );
+
+    return this.toDTO(driveFile);
+  }
+
+  /**
+   * Dispatch an image transform task to Lambda
+   *
+   * @param user - The user requesting the transform
+   * @param params - Transform parameters
+   * @returns Object containing the pre-created DriveFile and Lambda job
+   */
+  async dispatchLambdaImageTransform(
+    user: User,
+    params: {
+      canvasId: string;
+      name: string;
+      sourceKey: string;
+      options?: {
+        format?: 'webp' | 'jpeg' | 'png';
+        quality?: number;
+        maxWidth?: number;
+        maxHeight?: number;
+      };
+    },
+  ): Promise<{ driveFile: DriveFile; lambdaJob: LambdaJobRecord }> {
+    // Determine output content type based on format
+    const format = params.options?.format ?? 'webp';
+    const contentType = `image/${format}`;
+
+    // 1. Pre-create DriveFile record
+    const driveFile = await this.preCreateDriveFileForLambda(user, {
+      canvasId: params.canvasId,
+      name: params.name,
+      contentType,
+    });
+
+    // 2. Dispatch to Lambda
+    const inputBucket = this.config.get<string>('lambda.s3.inputBucket');
+    const outputBucket = this.config.get<string>('lambda.s3.bucket');
+
+    const lambdaJob = await this.lambdaService.dispatchImageTransform({
+      uid: user.uid,
+      fileId: driveFile.fileId,
+      s3Input: {
+        bucket: inputBucket,
+        key: params.sourceKey,
+      },
+      outputBucket,
+      name: params.name,
+      options: params.options,
+    });
+
+    this.logger.info(
+      `Dispatched Lambda image transform: fileId=${driveFile.fileId}, jobId=${lambdaJob.jobId}`,
+    );
+
+    return { driveFile, lambdaJob };
+  }
+
+  /**
+   * Dispatch a document render (export) task to Lambda
+   *
+   * @param user - The user requesting the export
+   * @param params - Export parameters
+   * @returns Object containing the pre-created DriveFile and Lambda job
+   */
+  async dispatchLambdaDocumentRender(
+    user: User,
+    params: {
+      canvasId: string;
+      name: string;
+      sourceKey: string;
+      format: 'pdf' | 'docx';
+      options?: {
+        template?: string;
+        pageSize?: 'A4' | 'Letter';
+      };
+    },
+  ): Promise<{ driveFile: DriveFile; lambdaJob: LambdaJobRecord }> {
+    // Determine content type based on format
+    const contentType =
+      params.format === 'pdf'
+        ? 'application/pdf'
+        : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+    // 1. Pre-create DriveFile record
+    const driveFile = await this.preCreateDriveFileForLambda(user, {
+      canvasId: params.canvasId,
+      name: params.name,
+      contentType,
+    });
+
+    // 2. Dispatch to Lambda
+    const inputBucket = this.config.get<string>('lambda.s3.inputBucket');
+    const outputBucket = this.config.get<string>('lambda.s3.bucket');
+
+    const lambdaJob = await this.lambdaService.dispatchDocumentRender({
+      uid: user.uid,
+      fileId: driveFile.fileId,
+      s3Input: {
+        bucket: inputBucket,
+        key: params.sourceKey,
+      },
+      outputBucket,
+      name: params.name,
+      format: params.format,
+      options: params.options,
+    });
+
+    this.logger.info(
+      `Dispatched Lambda document render: fileId=${driveFile.fileId}, jobId=${lambdaJob.jobId}`,
+    );
+
+    return { driveFile, lambdaJob };
+  }
+
+  /**
+   * Get Lambda job status for a file
+   *
+   * @param jobId - The Lambda job ID
+   * @returns Job status information
+   */
+  async getLambdaJobStatusInternal(jobId: string): Promise<{
+    job: LambdaJobRecord | null;
+    effectiveStatus: string | null;
+  }> {
+    const lambdaEnabled = this.config.get<boolean>('lambda.enabled') !== false;
+    if (!lambdaEnabled || !this.lambdaService) {
+      return { job: null, effectiveStatus: null };
+    }
+    return this.lambdaService.getJobStatus(jobId);
+  }
+
+  // ============================================================================
+  // Async Export Methods (Lambda-based)
+  // ============================================================================
+
+  /**
+   * Convert Lambda job status to ExportJobStatus
+   */
+  private mapLambdaStatusToExportStatus(
+    status: string,
+    effectiveStatus: string | null,
+  ): ExportJobStatus {
+    if (effectiveStatus === 'FAILED') return 'failed';
+    if (effectiveStatus === 'COMPLETED' || effectiveStatus === 'PENDING_PERSIST')
+      return 'completed';
+    if (effectiveStatus === 'PROCESSING' || status === 'processing') return 'processing';
+    return 'pending';
+  }
+
+  /**
+   * Convert LambdaJobRecord to ExportJob
+   */
+  private lambdaJobToExportJob(job: LambdaJobRecord, effectiveStatus: string | null): ExportJob {
+    return {
+      jobId: job.jobId,
+      fileId: job.fileId ?? undefined,
+      status: this.mapLambdaStatusToExportStatus(job.status, effectiveStatus),
+      format: job.mimeType?.includes('pdf') ? 'pdf' : 'docx',
+      name: job.name ?? undefined,
+      error: job.error ?? undefined,
+      createdAt: job.createdAt.toISOString(),
+    };
+  }
+
+  /**
+   * Start an async export job using Lambda
+   *
+   * @param user - The user requesting the export
+   * @param request - Export job request
+   * @returns ExportJob with job status
+   */
+  async startExportJob(user: User, request: StartExportJobRequest): Promise<ExportJob> {
+    const { fileId, format } = request;
+
+    const lambdaEnabled = this.config.get<boolean>('lambda.enabled') !== false;
+    if (!lambdaEnabled || !this.lambdaService) {
+      throw new ParamsError('Lambda service is not available for async export');
     }
 
-    // add title as H1 title
-    const title = doc.name ?? 'Untitled';
-    const markdownContent = `# ${title}\n\n${content ?? ''}`;
+    // Get the file to export
+    const doc = await this.prisma.driveFile.findFirst({
+      where: {
+        fileId,
+        uid: user.uid,
+        deletedAt: null,
+      },
+    });
 
-    // convert content to the format
-    switch (format) {
-      case 'markdown':
-        return Buffer.from(markdownContent);
-      case 'docx': {
-        const docxParser = new DocxParser();
-        const docxData = await docxParser.parse(markdownContent);
-        return docxData.buffer;
+    if (!doc) {
+      throw new DocumentNotFoundError('Document not found');
+    }
+
+    if (!doc.storageKey) {
+      throw new ParamsError('Document has no content to export');
+    }
+
+    // Always use the original file's storageKey for export
+    // (parseCache is for reading parsed content, not for export source)
+    const sourceKey = doc.storageKey;
+
+    // Dispatch Lambda document render job
+    const inputBucket = this.config.get<string>('lambda.s3.inputBucket');
+    const outputBucket = this.config.get<string>('lambda.s3.bucket');
+
+    const outputName = `${doc.name?.replace(/\.[^/.]+$/, '') || 'export'}.${format}`;
+
+    const lambdaJob = await this.lambdaService.dispatchDocumentRender({
+      uid: user.uid,
+      fileId,
+      s3Input: {
+        bucket: inputBucket,
+        key: sourceKey,
+      },
+      outputBucket,
+      name: outputName,
+      format,
+    });
+
+    this.logger.info(
+      `Started export job: fileId=${fileId}, jobId=${lambdaJob.jobId}, format=${format}`,
+    );
+
+    return this.lambdaJobToExportJob(lambdaJob, 'PENDING');
+  }
+
+  /**
+   * Get export job status
+   *
+   * @param user - The user requesting the status
+   * @param jobId - Export job ID
+   * @returns ExportJob with current status
+   */
+  async getExportJobStatus(user: User, jobId: string): Promise<ExportJob> {
+    if (!this.lambdaService) {
+      throw new ParamsError('Lambda service is not available');
+    }
+
+    const { job, effectiveStatus } = await this.lambdaService.getJobStatus(jobId);
+
+    if (!job) {
+      throw new NotFoundException('Export job not found');
+    }
+
+    // Verify the job belongs to this user
+    if (job.uid !== user.uid) {
+      throw new NotFoundException('Export job not found');
+    }
+
+    return this.lambdaJobToExportJob(job, effectiveStatus);
+  }
+
+  /**
+   * Download export job result
+   *
+   * @param user - The user downloading the result
+   * @param jobId - Export job ID
+   * @returns Buffer with file content, content type, and filename
+   */
+  async downloadExportJobResult(
+    user: User,
+    jobId: string,
+  ): Promise<{ data: Buffer; contentType: string; filename: string }> {
+    if (!this.lambdaService) {
+      throw new ParamsError('Lambda service is not available');
+    }
+
+    const { job, effectiveStatus } = await this.lambdaService.getJobStatus(jobId);
+
+    if (!job) {
+      throw new NotFoundException('Export job not found');
+    }
+
+    // Verify the job belongs to this user
+    if (job.uid !== user.uid) {
+      throw new NotFoundException('Export job not found');
+    }
+
+    // Check if job is completed
+    if (effectiveStatus !== 'COMPLETED' && effectiveStatus !== 'PENDING_PERSIST') {
+      throw new ParamsError(`Export job is not ready. Current status: ${effectiveStatus}`);
+    }
+
+    if (!job.storageKey) {
+      throw new ParamsError('Export job has no output file');
+    }
+
+    // Get the file from Lambda S3 bucket
+    const stream = await this.lambdaService.getJobOutput(job.storageKey);
+    if (!stream) {
+      throw new NotFoundException('Export result not found');
+    }
+
+    const data = await streamToBuffer(stream);
+    const contentType = job.mimeType || 'application/octet-stream';
+    const filename = job.name || `export.${contentType.includes('pdf') ? 'pdf' : 'docx'}`;
+
+    return { data, contentType, filename };
+  }
+
+  // =====================
+  // CLI Presigned Upload Methods
+  // =====================
+
+  /**
+   * Interface for presigned upload metadata stored in Redis
+   */
+  private buildPresignedUploadRedisKey(fileId: string): string {
+    return `${PENDING_UPLOAD_REDIS_PREFIX}${fileId}`;
+  }
+
+  /**
+   * Create a presigned upload URL for CLI uploads
+   * @param user - User performing the upload
+   * @param params - Upload parameters
+   * @returns Presigned upload URL and metadata
+   */
+  async createPresignedUpload(
+    user: User,
+    params: {
+      canvasId: string;
+      filename: string;
+      size: number;
+      contentType: string;
+    },
+  ): Promise<{
+    uploadId: string;
+    presignedUrl: string;
+    expiresIn: number;
+  }> {
+    const { canvasId, filename, size, contentType } = params;
+
+    // Validate required parameters
+    if (!canvasId) {
+      throw new ParamsError('canvasId is required');
+    }
+    if (!filename) {
+      throw new ParamsError('filename is required');
+    }
+    if (size === undefined || size === null) {
+      throw new ParamsError('size is required');
+    }
+    if (!contentType) {
+      throw new ParamsError('contentType is required');
+    }
+
+    // Validate canvas exists and user has access
+    const canvas = await this.prisma.canvas.findFirst({
+      where: { canvasId, uid: user.uid, deletedAt: null },
+    });
+    if (!canvas) {
+      throw new DocumentNotFoundError(`Canvas not found: ${canvasId}`);
+    }
+
+    // Validate file size
+    if (size > MAX_CLI_UPLOAD_SIZE) {
+      throw new FileTooLargeError(
+        `File size ${size} exceeds maximum allowed size ${MAX_CLI_UPLOAD_SIZE}`,
+      );
+    }
+
+    // Validate content type
+    if (!isContentTypeAllowed(contentType)) {
+      throw new InvalidContentTypeError(
+        `Content type '${contentType}' is not allowed for CLI uploads`,
+      );
+    }
+
+    // Generate file ID and storage key with CLI-specific path
+    const fileId = genDriveFileID();
+    const prefix = this.config.get<string>('drive.storageKeyPrefix').replace(/\/$/, '');
+    const storageKey = `${prefix}/cli/${user.uid}/${canvasId}/${fileId}-${filename}`;
+
+    // Create pending DB record (size=0 indicates pending)
+    await this.prisma.driveFile.create({
+      data: {
+        fileId,
+        uid: user.uid,
+        canvasId,
+        name: filename,
+        type: contentType,
+        size: BigInt(0), // Pending upload
+        storageKey,
+        source: 'manual',
+        scope: 'present',
+        category: getFileCategory(contentType),
+      },
+    });
+
+    // Generate presigned PUT URL
+    let presignedUrl: string;
+    try {
+      presignedUrl = await this.internalOss.presignedPutObject(storageKey, PRESIGNED_UPLOAD_EXPIRY);
+    } catch (error) {
+      // Clean up DB record if presign fails
+      await this.prisma.driveFile.delete({ where: { fileId } }).catch(() => {});
+      if ((error as Error).message?.includes('PRESIGN_NOT_SUPPORTED')) {
+        throw new PresignNotSupportedError();
       }
-      case 'pdf': {
-        const pdfParser = new PdfParser();
-        const pdfData = await pdfParser.parse(markdownContent);
-        return pdfData.buffer;
+      throw error;
+    }
+
+    // Store metadata in Redis for confirmation step
+    const metadata = JSON.stringify({
+      expectedSize: size,
+      contentType,
+      canvasId,
+      uid: user.uid,
+      storageKey,
+    });
+    await this.redis.setex(
+      this.buildPresignedUploadRedisKey(fileId),
+      PENDING_UPLOAD_REDIS_TTL,
+      metadata,
+    );
+
+    return {
+      uploadId: fileId,
+      presignedUrl,
+      expiresIn: PRESIGNED_UPLOAD_EXPIRY,
+    };
+  }
+
+  /**
+   * Confirm a presigned upload has completed
+   * @param user - User who initiated the upload
+   * @param uploadId - The upload ID (file ID) returned from createPresignedUpload
+   * @returns The completed drive file
+   */
+  async confirmPresignedUpload(user: User, uploadId: string): Promise<DriveFile> {
+    // Read metadata from Redis
+    const redisKey = this.buildPresignedUploadRedisKey(uploadId);
+    const metadataStr = await this.redis.get(redisKey);
+
+    if (!metadataStr) {
+      throw new UploadExpiredError('Upload session expired or not found');
+    }
+
+    const metadata = JSON.parse(metadataStr) as {
+      expectedSize: number;
+      contentType: string;
+      canvasId: string;
+      uid: string;
+      storageKey: string;
+    };
+
+    // Verify ownership
+    if (metadata.uid !== user.uid) {
+      throw new ParamsError('Upload does not belong to this user');
+    }
+
+    // Get actual file size from object storage
+    const objectInfo = await this.internalOss.statObject(metadata.storageKey);
+
+    if (!objectInfo) {
+      // File not uploaded yet or upload failed
+      throw new UploadSizeMismatchError('File not found in storage. Upload may have failed.');
+    }
+
+    // Verify size matches (with some tolerance for content-length header differences)
+    const sizeDiff = Math.abs(objectInfo.size - metadata.expectedSize);
+    const tolerance = Math.max(1024, metadata.expectedSize * 0.01); // 1KB or 1% tolerance
+
+    if (sizeDiff > tolerance) {
+      // Size mismatch - delete the uploaded object
+      this.logger.warn(
+        { uploadId, expected: metadata.expectedSize, actual: objectInfo.size },
+        'Upload size mismatch, cleaning up',
+      );
+      await this.internalOss.removeObject(metadata.storageKey, true).catch((err) => {
+        this.logger.error(`Failed to cleanup mismatched upload: ${err.message}`);
+      });
+      throw new UploadSizeMismatchError(
+        `Expected ${metadata.expectedSize} bytes, got ${objectInfo.size} bytes`,
+      );
+    }
+
+    // Update DB record with actual size
+    const updatedFile = await this.prisma.driveFile.update({
+      where: { fileId: uploadId },
+      data: {
+        size: BigInt(objectInfo.size),
+        updatedAt: new Date(),
+      },
+    });
+
+    // Delete Redis key
+    await this.redis.del(redisKey);
+
+    return this.toDTO(updatedFile);
+  }
+
+  /**
+   * Cleanup stale pending uploads (size=0 and older than threshold)
+   * Runs every 15 minutes
+   */
+  @Cron('0 */15 * * * *')
+  async cleanupStalePendingUploads(): Promise<void> {
+    const lockKey = 'cli:drive:upload:cleanup:lock';
+    const lockTTL = 300; // 5 minutes
+
+    // Try to acquire distributed lock
+    const releaseLock = await this.redis.acquireLock(lockKey, lockTTL);
+    if (!releaseLock) {
+      return; // Another instance is running cleanup
+    }
+
+    try {
+      const cutoffTime = new Date(Date.now() - PENDING_UPLOAD_CLEANUP_AGE);
+      const prefix = this.config.get<string>('drive.storageKeyPrefix').replace(/\/$/, '');
+      const cliPrefix = `${prefix}/cli/`;
+
+      // Find stale pending uploads
+      const staleFiles = await this.prisma.driveFile.findMany({
+        where: {
+          size: BigInt(0),
+          createdAt: { lt: cutoffTime },
+          storageKey: { startsWith: cliPrefix },
+        },
+        select: { fileId: true, storageKey: true, createdAt: true, updatedAt: true },
+        take: 100, // Limit batch size
+      });
+
+      if (staleFiles.length === 0) {
+        return;
       }
-      default:
-        throw new ParamsError('Unsupported format');
+
+      this.logger.info({ count: staleFiles.length }, 'Cleaning up stale pending CLI uploads');
+
+      // Delete from storage and database
+      for (const file of staleFiles) {
+        try {
+          // Skip confirmed zero-byte uploads (updatedAt changes on confirmation)
+          if (file.updatedAt.getTime() - file.createdAt.getTime() > 500) {
+            continue;
+          }
+
+          // Delete from object storage (ignore if not found)
+          if (file.storageKey) {
+            await this.internalOss.removeObject(file.storageKey, true).catch(() => {});
+          }
+
+          // Hard delete DB record
+          await this.prisma.driveFile.delete({ where: { fileId: file.fileId } });
+
+          // Delete Redis key if exists
+          await this.redis.del(this.buildPresignedUploadRedisKey(file.fileId));
+        } catch (err) {
+          this.logger.warn(
+            { fileId: file.fileId, error: (err as Error).message },
+            'Failed to cleanup stale upload',
+          );
+        }
+      }
+
+      this.logger.info(
+        { cleaned: staleFiles.length },
+        'Finished cleaning up stale pending uploads',
+      );
+    } finally {
+      // Release lock
+      await releaseLock();
     }
   }
 }

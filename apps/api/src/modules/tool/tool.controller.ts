@@ -1,9 +1,11 @@
-import { Body, Controller, Get, ParseBoolPipe, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, ParseBoolPipe, Post, Query, Req, UseGuards } from '@nestjs/common';
+import { Request } from 'express';
 import { JwtAuthGuard } from '../auth/guard/jwt-auth.guard';
 import { LoginedUser } from '../../utils/decorators/user.decorator';
 import { User as UserModel } from '@prisma/client';
 import { buildSuccessResponse } from '../../utils/response';
 import { ToolService } from './tool.service';
+import { ToolExecutionService, ToolDefinitionService } from './ptc';
 import {
   BaseResponse,
   ListToolsResponse,
@@ -14,12 +16,19 @@ import {
   ListToolsetInventoryResponse,
   ListUserToolsResponse,
   GetToolCallResultResponse,
+  ExecuteToolRequest,
+  ExecuteToolResponse,
+  ExportToolsetDefinitionsResponse,
 } from '@refly/openapi-schema';
 import { toolsetPO2DTO } from './tool.dto';
 
 @Controller('v1/tool')
 export class ToolController {
-  constructor(private readonly toolService: ToolService) {}
+  constructor(
+    private readonly toolService: ToolService,
+    private readonly toolExecutionService: ToolExecutionService,
+    private readonly toolDefinitionService: ToolDefinitionService,
+  ) {}
 
   @UseGuards(JwtAuthGuard)
   @Get('/list')
@@ -27,7 +36,16 @@ export class ToolController {
     @LoginedUser() user: UserModel,
     @Query('isGlobal', new ParseBoolPipe({ optional: true })) isGlobal: boolean,
     @Query('enabled', new ParseBoolPipe({ optional: true })) enabled: boolean,
+    @Query('includeUnauthorized', new ParseBoolPipe({ optional: true }))
+    includeUnauthorized: boolean,
   ): Promise<ListToolsResponse> {
+    // If includeUnauthorized is true, use listAllToolsForCopilot which includes unauthorized tools
+    if (includeUnauthorized) {
+      const tools = await this.toolService.listAllToolsForCopilot(user);
+      const populatedTools = await this.toolService.populateToolsetsWithDefinition(tools);
+      return buildSuccessResponse(populatedTools);
+    }
+
     const tools = await this.toolService.listTools(user, {
       isGlobal,
       enabled,
@@ -100,6 +118,15 @@ export class ToolController {
   }
 
   @UseGuards(JwtAuthGuard)
+  @Get('/toolset/exportDefinitions')
+  async exportToolsetDefinitions(
+    @Query('toolsetKey') toolsetKey?: string,
+  ): Promise<ExportToolsetDefinitionsResponse> {
+    const definitions = await this.toolDefinitionService.exportToolsetDefinitions(toolsetKey);
+    return buildSuccessResponse(definitions);
+  }
+
+  @UseGuards(JwtAuthGuard)
   @Get('/call/result')
   async getToolCallResult(
     @LoginedUser() user: UserModel,
@@ -107,5 +134,29 @@ export class ToolController {
   ): Promise<GetToolCallResultResponse> {
     const result = await this.toolService.getToolCallResult(user, toolCallId);
     return buildSuccessResponse({ result });
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('/execute')
+  async executeTool(
+    @LoginedUser() user: UserModel,
+    @Body() request: ExecuteToolRequest,
+    @Req() req: Request,
+  ): Promise<ExecuteToolResponse> {
+    // Extract PTC context from headers
+    const headers = req?.headers ?? {};
+    const ptcCallId = headers?.['x-ptc-call-id'] as string | undefined;
+    const resultId = headers?.['x-refly-result-id'] as string | undefined;
+    const versionStr = headers?.['x-refly-result-version'] as string | undefined;
+    const canvasId = headers?.['x-refly-canvas-id'] as string | undefined;
+    const version = versionStr ? Number.parseInt(versionStr, 10) : undefined;
+
+    const result = await this.toolExecutionService.executeTool(user, request, {
+      ptcCallId,
+      resultId,
+      version,
+      canvasId,
+    });
+    return buildSuccessResponse(result);
   }
 }

@@ -36,7 +36,8 @@ export default () => ({
     archiveConcurrencyLimit: Number.parseInt(process.env.DRIVE_ARCHIVE_CONCURRENCY_LIMIT) || 10, // Maximum concurrent file archive operations
     publicEndpoint:
       process.env.DRIVE_PUBLIC_ENDPOINT || 'http://localhost:5800/v1/drive/file/public',
-    maxContentTokens: Number.parseInt(process.env.DRIVE_MAX_CONTENT_TOKENS) || 25000, // Maximum tokens in returned content (aligned with Claude Code's limit)
+    maxContentTokens: Number.parseInt(process.env.DRIVE_MAX_CONTENT_TOKENS) || 50000, // Maximum tokens in returned content
+    maxStorageTokens: Number.parseInt(process.env.DRIVE_MAX_STORAGE_TOKENS) || 100000, // Maximum tokens when storing parsed content (higher to preserve more)
     maxParseFileSizeKB: Number.parseInt(process.env.DRIVE_MAX_PARSE_FILE_SIZE_KB) || 512, // Maximum file size (KB) for direct parsing, larger files should use execute_code
   },
   session: {
@@ -103,13 +104,17 @@ export default () => ({
     redirectUrl: process.env.LOGIN_REDIRECT_URL,
     cookie: {
       domain: process.env.REFLY_COOKIE_DOMAIN,
-      secure: process.env.REFLY_COOKIE_SECURE,
+      secure: process.env.REFLY_COOKIE_SECURE === 'true' || false,
       sameSite: process.env.REFLY_COOKIE_SAME_SITE,
     },
     jwt: {
       secret: process.env.JWT_SECRET || 'test',
       expiresIn: process.env.JWT_EXPIRATION_TIME || '1d',
       refreshExpiresIn: process.env.JWT_REFRESH_EXPIRATION_TIME || '14d',
+    },
+    turnstile: {
+      enabled: process.env.CLOUDFLARE_TURNSTILE_ENABLED === 'true' || false,
+      secretKey: process.env.CLOUDFLARE_TURNSTILE_SECRET_KEY,
     },
     collab: {
       tokenExpiry: process.env.COLLAB_TOKEN_EXPIRY || '1h',
@@ -147,20 +152,25 @@ export default () => ({
     },
     invitation: {
       requireInvitationCode: process.env.AUTH_REQUIRE_INVITATION_CODE === 'true' || false,
+      maxCodesPerUser: Number.parseInt(process.env.INVITATION_MAX_CODES_PER_USER) || 20,
       inviterCreditAmount: Number.parseInt(process.env.INVITATION_INVITER_CREDIT_AMOUNT) || 500,
       inviteeCreditAmount: Number.parseInt(process.env.INVITATION_INVITEE_CREDIT_AMOUNT) || 500,
-      inviterCreditExpiresInMonths:
-        Number.parseInt(process.env.INVITATION_INVITER_CREDIT_EXPIRES_IN_MONTHS) || 3,
-      inviteeCreditExpiresInMonths:
-        Number.parseInt(process.env.INVITATION_INVITEE_CREDIT_EXPIRES_IN_MONTHS) || 3,
+      inviterCreditExpiresInDays:
+        Number.parseInt(process.env.INVITATION_INVITER_CREDIT_EXPIRES_IN_DAYS) || 7,
+      inviteeCreditExpiresInDays:
+        Number.parseInt(process.env.INVITATION_INVITEE_CREDIT_EXPIRES_IN_DAYS) || 7,
     },
     registration: {
-      bonusCreditAmount: Number.parseInt(process.env.REGISTRATION_BONUS_CREDIT_AMOUNT) || 3000,
-      bonusCreditExpiresInMonths:
-        Number.parseInt(process.env.REGISTRATION_BONUS_CREDIT_EXPIRES_IN_MONTHS) || 3,
+      bonusCreditAmount: Number.parseInt(process.env.REGISTRATION_BONUS_CREDIT_AMOUNT) || 500,
+      bonusCreditExpiresInDays:
+        Number.parseInt(process.env.REGISTRATION_BONUS_CREDIT_EXPIRES_IN_DAYS) || 7,
+    },
+    onboarding: {
+      enabled: process.env.ONBOARDING_ENABLED === 'true' || false,
     },
   },
   tools: {
+    webSearchEnabled: process.env.WEB_SEARCH_ENABLED === 'true',
     supportedToolsets: process.env.SUPPORTED_TOOLSETS || '', // comma separated list of toolset keys
     google: {
       clientId: process.env.GOOGLE_TOOLS_CLIENT_ID,
@@ -241,6 +251,15 @@ export default () => ({
     // Expiration time in minutes (default: 7 days = 10080 minutes)
     // For testing, use smaller values like 7 (7 minutes)
     expirationMinutes: Number(process.env.VOUCHER_EXPIRATION_MINUTES) || 10080,
+    // Default discount percentage for vouchers (default: 80% off)
+    defaultDiscountPercent: Number(process.env.VOUCHER_DEFAULT_DISCOUNT_PERCENT) || 80,
+  },
+  ptc: {
+    mode: process.env.PTC_MODE || 'off',
+    debug: process.env.PTC_DEBUG || '',
+    userAllowlist: process.env.PTC_USER_ALLOWLIST || '',
+    toolsetAllowlist: process.env.PTC_TOOLSET_ALLOWLIST || '',
+    toolsetBlocklist: process.env.PTC_TOOLSET_BLOCKLIST || '',
   },
   schedule: {
     // Rate limiting - controls global and per-user concurrency
@@ -275,7 +294,78 @@ export default () => ({
     },
   },
 
+  lambda: {
+    enabled: process.env.LAMBDA_ENABLED !== 'false', // Lambda enabled by default, set LAMBDA_ENABLED=false to disable
+    region: process.env.AWS_REGION || 'us-east-1',
+    functions: {
+      documentIngest: process.env.LAMBDA_DOC_PARSER_ARN,
+      imageTransform: process.env.LAMBDA_IMAGE_PROCESSOR_ARN,
+      documentRender: process.env.LAMBDA_DOC_EXPORTER_ARN,
+      videoAnalyze: process.env.LAMBDA_VIDEO_ANALYZER_ARN,
+    },
+    sqs: {
+      docIngestQueueUrl: process.env.SQS_DOC_PARSE_QUEUE_URL,
+      imageTransformQueueUrl: process.env.SQS_IMAGE_PROCESS_QUEUE_URL,
+      documentRenderQueueUrl: process.env.SQS_DOC_RENDER_QUEUE_URL,
+      videoAnalyzeQueueUrl: process.env.SQS_VIDEO_ANALYZE_QUEUE_URL,
+      resultQueueUrl: process.env.SQS_RESULT_QUEUE_URL,
+      bridge: {
+        pollIntervalMs: Number.parseInt(process.env.SQS_BRIDGE_POLL_INTERVAL_MS || '1000'),
+        maxMessages: Number.parseInt(process.env.SQS_BRIDGE_MAX_MESSAGES || '10'),
+        waitTimeSeconds: Number.parseInt(process.env.SQS_BRIDGE_WAIT_TIME_SECONDS || '20'),
+        visibilityTimeout: Number.parseInt(process.env.SQS_BRIDGE_VISIBILITY_TIMEOUT || '60'),
+      },
+    },
+    videoAnalyze: {
+      defaultFrameCount: Number.parseInt(process.env.VIDEO_DEFAULT_FRAME_COUNT) || 10,
+      maxDuration: Number.parseInt(process.env.VIDEO_MAX_DURATION) || 600, // 10 minutes
+    },
+    s3: {
+      inputBucket:
+        process.env.LAMBDA_INPUT_S3_BUCKET || process.env.MINIO_INTERNAL_BUCKET || 'refly-weblink',
+      bucket: process.env.LAMBDA_S3_BUCKET || process.env.MINIO_INTERNAL_BUCKET || 'refly-weblink',
+      outputPrefix: process.env.LAMBDA_OUTPUT_PREFIX || 'lambda-output',
+    },
+    resultPolling: {
+      intervalMs: Number.parseInt(process.env.LAMBDA_RESULT_POLL_INTERVAL_MS) || 1000,
+      maxRetries: Number.parseInt(process.env.LAMBDA_RESULT_MAX_RETRIES) || 300, // 5 min with 1s interval
+    },
+    parseTimeoutMs: Number.parseInt(process.env.LAMBDA_PARSE_TIMEOUT_MS) || 3 * 60 * 1000, // 3 minutes
+  },
+
+  workflow: {
+    // Interval between polling checks for workflow status (default: 1.5 seconds)
+    pollIntervalMs: Number.parseInt(process.env.WORKFLOW_POLL_INTERVAL_MS) || 1500,
+    // Maximum time allowed for entire workflow execution (default: 30 minutes)
+    executionTimeoutMs:
+      Number.parseInt(process.env.WORKFLOW_EXECUTION_TIMEOUT_MS) || 30 * 60 * 1000,
+    // Maximum time allowed for a single node execution (default: 30 minutes)
+    nodeExecutionTimeoutMs:
+      Number.parseInt(process.env.WORKFLOW_NODE_EXECUTION_TIMEOUT_MS) || 30 * 60 * 1000,
+    // TTL for distributed lock during polling (default: 5 seconds)
+    pollLockTtlMs: Number.parseInt(process.env.WORKFLOW_POLL_LOCK_TTL_MS) || 5000,
+  },
+
   sandbox: {
+    url: process.env.SANDBOX_URL,
+    timeout: process.env.SANDBOX_TIMEOUT_MS,
+    whiteList: process.env.SANDBOX_WHITELIST, // 'uid,uid'
+    blackList: process.env.SANDBOX_BLACKLIST, // 'uid,uid'
+    randomRate: process.env.SANDBOX_RANDOM_RATE, // '20'
+    s3Lib: {
+      enabled: process.env.SANDBOX_S3LIB_ENABLED,
+      pathPrefix: process.env.SANDBOX_S3LIB_PATH_PREFIX,
+      hash: process.env.SANDBOX_S3LIB_HASH,
+      cache: process.env.SANDBOX_S3LIB_CACHE,
+      reset: process.env.SANDBOX_S3LIB_RESET,
+    },
+    s3: {
+      overlap: {
+        enabled: process.env.SANDBOX_S3_OVERLAP_ENABLED,
+        endpoint: process.env.SANDBOX_S3_OVERLAP_ENDPOINT,
+        port: process.env.SANDBOX_S3_OVERLAP_PORT,
+      },
+    },
     scalebox: {
       apiKey: process.env.SCALEBOX_API_KEY,
       // Wrapper

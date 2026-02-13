@@ -3,14 +3,20 @@ import { Skeleton } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { ActionResult, GenericToolset } from '@refly/openapi-schema';
 import { ActionStepCard } from './action-step';
-import EmptyImage from '@refly-packages/ai-workspace-common/assets/noResource.svg';
+import EmptyImage from '@refly-packages/ai-workspace-common/assets/noResource.webp';
 import { actionEmitter } from '@refly-packages/ai-workspace-common/events/action';
 import { MessageList } from '@refly-packages/ai-workspace-common/components/result-message';
+import {
+  LastRunTabContext,
+  LastRunTabLocation,
+} from '@refly-packages/ai-workspace-common/context/run-location';
+import { useActionResultStoreShallow } from '@refly/stores';
 
 interface LastRunTabProps {
   loading: boolean;
   isStreaming: boolean;
   resultId: string;
+  location: LastRunTabLocation;
   result?: ActionResult;
   outputStep?: ActionResult['steps'][number];
   query?: string | null;
@@ -156,5 +162,20 @@ const LastRunTabComponent = ({
   );
 };
 
-export const LastRunTab = memo(LastRunTabComponent);
+export const LastRunTab = memo((props: LastRunTabProps) => {
+  const { location } = props;
+
+  // Get actionResultStore's setCurrentFile for drawer preview
+  const { setCurrentFile } = useActionResultStoreShallow((state) => ({
+    setCurrentFile: state.setCurrentFile,
+  }));
+
+  const contextValue = useMemo(() => ({ location, setCurrentFile }), [location, setCurrentFile]);
+
+  return (
+    <LastRunTabContext.Provider value={contextValue}>
+      <LastRunTabComponent {...props} />
+    </LastRunTabContext.Provider>
+  );
+});
 LastRunTab.displayName = 'LastRunTab';

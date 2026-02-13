@@ -217,9 +217,13 @@ export class CreditService {
       return;
     }
 
-    const giftCreditAmount = this.configService.get('credit.firstSubscriptionGiftCreditAmount');
-    const giftCreditExpiresInMonths = this.configService.get(
+    const giftCreditAmount = this.configService.get<number>(
+      'credit.firstSubscriptionGiftCreditAmount',
+      2000,
+    );
+    const giftCreditExpiresInMonths = this.configService.get<number>(
       'credit.firstSubscriptionGiftCreditExpiresInMonths',
+      1,
     );
 
     // Calculate expiration date
@@ -251,7 +255,7 @@ export class CreditService {
     description?: string,
     now: Date = new Date(),
   ): Promise<void> {
-    const expiresInDays = this.configService.get('credit.creditPackExpiresInDays');
+    const expiresInDays = this.configService.get<number>('credit.creditPackExpiresInDays', 90);
     const expiresAt = new Date(now);
     expiresAt.setDate(expiresAt.getDate() + expiresInDays);
     await this.processCreditRecharge(
@@ -284,7 +288,7 @@ export class CreditService {
     const now = new Date();
     const expiresAt = new Date(now);
     expiresAt.setMonth(
-      expiresAt.getMonth() + this.configService.get('credit.commissionCreditExpiresIn'),
+      expiresAt.getMonth() + this.configService.get<number>('credit.commissionCreditExpiresIn', 6),
     );
 
     await this.processCreditRecharge(
@@ -303,7 +307,7 @@ export class CreditService {
         shareId,
         title,
         appId,
-        commissionRate: this.configService.get('credit.canvasCreditCommissionRate'),
+        commissionRate: this.configService.get<number>('credit.canvasCreditCommissionRate', 0.2),
       },
       appId,
     );
@@ -323,7 +327,7 @@ export class CreditService {
         shareId,
         title,
         appId,
-        commissionRate: this.configService.get('credit.canvasCreditCommissionRate'),
+        commissionRate: this.configService.get<number>('credit.canvasCreditCommissionRate', 0.2),
       },
     );
   }
@@ -349,14 +353,18 @@ export class CreditService {
       return;
     }
 
-    const bonusCreditAmount = this.configService.get('auth.registration.bonusCreditAmount');
-    const bonusCreditExpiresInMonths = this.configService.get(
-      'auth.registration.bonusCreditExpiresInMonths',
+    const bonusCreditAmount = this.configService.get<number>(
+      'auth.registration.bonusCreditAmount',
+      500,
+    );
+    const bonusCreditExpiresInDays = this.configService.get<number>(
+      'auth.registration.bonusCreditExpiresInDays',
+      7,
     );
 
     // Calculate expiration date
     const expiresAt = new Date(now);
-    expiresAt.setMonth(expiresAt.getMonth() + bonusCreditExpiresInMonths);
+    expiresAt.setDate(expiresAt.getDate() + bonusCreditExpiresInDays);
 
     await this.processCreditRecharge(
       uid,
@@ -385,21 +393,29 @@ export class CreditService {
     inviteeUid: string,
     now: Date = new Date(),
   ): Promise<void> {
-    const inviterCreditAmount = this.configService.get('auth.invitation.inviterCreditAmount');
-    const inviteeCreditAmount = this.configService.get('auth.invitation.inviteeCreditAmount');
-    const inviterCreditExpiresInMonths = this.configService.get(
-      'auth.invitation.inviterCreditExpiresInMonths',
+    const inviterCreditAmount = this.configService.get<number>(
+      'auth.invitation.inviterCreditAmount',
+      500,
     );
-    const inviteeCreditExpiresInMonths = this.configService.get(
-      'auth.invitation.inviteeCreditExpiresInMonths',
+    const inviteeCreditAmount = this.configService.get<number>(
+      'auth.invitation.inviteeCreditAmount',
+      500,
+    );
+    const inviterCreditExpiresInDays = this.configService.get<number>(
+      'auth.invitation.inviterCreditExpiresInDays',
+      7,
+    );
+    const inviteeCreditExpiresInDays = this.configService.get<number>(
+      'auth.invitation.inviteeCreditExpiresInDays',
+      7,
     );
 
     // Calculate expiration dates
     const inviterExpiresAt = new Date(now);
-    inviterExpiresAt.setMonth(inviterExpiresAt.getMonth() + inviterCreditExpiresInMonths);
+    inviterExpiresAt.setDate(inviterExpiresAt.getDate() + inviterCreditExpiresInDays);
 
     const inviteeExpiresAt = new Date(now);
-    inviteeExpiresAt.setMonth(inviteeExpiresAt.getMonth() + inviteeCreditExpiresInMonths);
+    inviteeExpiresAt.setDate(inviteeExpiresAt.getDate() + inviteeCreditExpiresInDays);
 
     // Create recharge for inviter
     await this.processCreditRecharge(
@@ -1218,7 +1234,6 @@ export class CreditService {
         modelName: true,
         usageType: true,
         actionResultId: true,
-        pilotSessionId: true,
         description: true,
         extraData: true,
         createdAt: true,
@@ -1484,17 +1499,32 @@ export class CreditService {
     if (!execution) {
       return 0;
     }
+
+    // Use workflowExecutionId to find all ActionResult records for this execution
+    // This is more accurate than using targetId, and ensures data consistency
     const results = await this.prisma.actionResult.findMany({
       where: {
-        targetId: execution.canvasId,
+        workflowExecutionId: executionId,
+        uid: user.uid,
+      },
+      select: {
+        resultId: true,
+        version: true,
       },
     });
-    const total = await Promise.all(
-      results.map((result) => this.countResultCreditUsage(user, result.resultId)),
+
+    if (results.length === 0) {
+      return 0;
+    }
+
+    // Calculate credit usage for each (resultId, version) combination
+    // This ensures consistency with frontend node display (which shows per-version credits)
+    // and accounts for all versions (including retries) of each node
+    const totals = await Promise.all(
+      results.map((result) => this.countResultCreditUsage(user, result.resultId, result.version)),
     );
-    return total.reduce((sum, total) => {
-      return sum + total;
-    }, 0);
+
+    return totals.reduce((sum, total) => sum + total, 0);
   }
 
   async countCanvasCreditUsageByCanvasId(user: User, canvasId: string): Promise<number> {

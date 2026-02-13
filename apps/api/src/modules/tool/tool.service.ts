@@ -54,6 +54,22 @@ import {
 } from './tool.dto';
 import { ToolWrapperFactoryService } from './tool-execution/wrapper/wrapper.service';
 
+/**
+ * Categorized tools returned from instantiateToolsets
+ */
+export interface InstantiatedTools {
+  // All tools (builtin + non-builtin), for backward compatibility
+  all: StructuredToolInterface[];
+  // Builtin tools (builtin + copilot), available in PTC mode
+  builtIn: StructuredToolInterface[];
+  // Non-builtin tools (regular + MCP + OAuth), used as SDK tools in PTC mode
+  nonBuiltIn: StructuredToolInterface[];
+  // Builtin toolsets (builtin + copilot)
+  builtInToolsets: GenericToolset[];
+  // Non-builtin toolsets (regular + MCP + OAuth)
+  nonBuiltInToolsets: GenericToolset[];
+}
+
 @Injectable()
 export class ToolService {
   private logger = new Logger(ToolService.name);
@@ -77,7 +93,10 @@ export class ToolService {
   }
 
   private isDeprecatedToolset(key?: string): boolean {
-    return key === 'web_search';
+    if (key === 'web_search') {
+      return !this.configService.get<boolean>('tools.webSearchEnabled');
+    }
+    return false;
   }
 
   /**
@@ -85,11 +104,19 @@ export class ToolService {
    * Filters out deprecated and internal (system-level) toolsets.
    * Internal toolsets are auto-included by the system and not user-selectable.
    */
-  private shouldExposeToolset(key?: string, options?: { internal?: boolean }): boolean {
+  private shouldExposeToolset(definition?: Partial<ToolsetDefinition>): boolean {
+    const key = definition?.key;
     if (!key) return true;
     if (this.isDeprecatedToolset(key)) return false;
     // Filter out internal/system-level toolsets (e.g., read_file, list_files)
-    if (options?.internal) return false;
+    if (definition?.internal) return false;
+    // Hide OAuth tools when Composio is not configured
+    if (
+      definition?.authPatterns?.some((p) => p.type === 'oauth') &&
+      !this.configService.get('composio.apiKey')
+    ) {
+      return false;
+    }
     return true;
   }
 
@@ -127,7 +154,7 @@ export class ToolService {
     }));
     const definitions = await this.inventoryService.getInventoryDefinitions();
     return [...builtinInventory, ...definitions]
-      .filter((definition) => this.shouldExposeToolset(definition.key))
+      .filter((definition) => this.shouldExposeToolset(definition))
       .sort((a, b) => a.key.localeCompare(b.key));
   }
 
@@ -151,7 +178,7 @@ export class ToolService {
     // external_oauth type tools have requiresAuth=true and authPatterns with type='oauth'
     const allDefinitions = await this.inventoryService.getInventoryDefinitions();
     const unauthorizedTools = allDefinitions.filter(
-      (def) => this.shouldExposeToolset(def.key) && def.requiresAuth && !installedKeys.has(def.key),
+      (def) => this.shouldExposeToolset(def) && def.requiresAuth && !installedKeys.has(def.key),
     );
 
     // 4. Build result: authorized tools first, then unauthorized
@@ -182,14 +209,16 @@ export class ToolService {
    * List builtin tools for mentionList.
    * Filters out internal (system-level) tools that are auto-included.
    */
-  listBuiltinTools(): GenericToolset[] {
+  listBuiltinTools(param?: ListToolsData['query']): GenericToolset[] {
+    const { isGlobal } = param ?? {};
+    // Builtin tools are always global, so return empty if filtering for non-global
+    if (isGlobal === false) {
+      return [];
+    }
+
     return Object.values(builtinToolsetInventory)
       .filter(
-        (toolset) =>
-          Boolean(toolset.definition) &&
-          this.shouldExposeToolset(toolset.definition.key, {
-            internal: toolset.definition.internal,
-          }),
+        (toolset) => Boolean(toolset.definition) && this.shouldExposeToolset(toolset.definition),
       )
       .map((toolset) => ({
         type: ToolsetType.REGULAR,
@@ -210,7 +239,18 @@ export class ToolService {
    * Queries active integrations from composio_connections and returns corresponding toolsets
    */
   async listOAuthTools(user: User, param?: ListToolsData['query']): Promise<GenericToolset[]> {
-    const { enabled } = param ?? {};
+    const { enabled, isGlobal } = param ?? {};
+
+    // Hide all OAuth tools when Composio is not configured
+    if (!this.configService.get('composio.apiKey')) {
+      return [];
+    }
+
+    // OAuth tools are currently always user-specific, return empty if filtering for global
+    if (isGlobal === true) {
+      return [];
+    }
+
     // Get active Composio connections for the user
     const activeConnections = await this.prisma.composioConnection.findMany({
       where: {
@@ -238,6 +278,7 @@ export class ToolService {
         uninstalled: false,
         deletedAt: null,
         uid: user.uid,
+        isGlobal: false,
         ...(enabled !== undefined && { enabled }),
       },
     });
@@ -259,19 +300,27 @@ export class ToolService {
       uninstalled: false,
       deletedAt: null,
       authType: { not: AuthType.OAUTH },
-      OR:
-        isGlobal !== undefined
-          ? [{ isGlobal }, { uid: user.uid }]
-          : [{ isGlobal: true }, { uid: user.uid }],
       ...(enabled !== undefined && { enabled }),
     };
+
+    if (isGlobal === true) {
+      whereCondition.isGlobal = true;
+    } else if (isGlobal === false) {
+      whereCondition.isGlobal = false;
+      whereCondition.uid = user.uid;
+    } else {
+      // Default: show both global and personal
+      whereCondition.OR = [{ isGlobal: true }, { uid: user.uid }];
+    }
 
     const toolsets = await this.prisma.toolset.findMany({
       where: whereCondition,
     });
     const inventoryMap = await this.inventoryService.getInventoryMap();
     return toolsets
-      .filter((toolset) => this.shouldExposeToolset(toolset.key))
+      .filter((toolset) =>
+        this.shouldExposeToolset(toolset.key ? inventoryMap[toolset.key]?.definition : undefined),
+      )
       .map((toolset) => toolsetPo2GenericToolset(toolset, inventoryMap));
   }
 
@@ -285,13 +334,52 @@ export class ToolService {
   }
 
   async listTools(user: User, param?: ListToolsData['query']): Promise<GenericToolset[]> {
-    const builtinTools = this.listBuiltinTools();
+    const builtinTools = this.listBuiltinTools(param);
     const [regularTools, oauthTools, mcpTools] = await Promise.all([
       this.listRegularTools(user, param), // Includes both regular
       this.listOAuthTools(user, param), // OAuth tools from Composio connections
       this.listMcpTools(user, param), // MCP server tools
     ]);
     return [...builtinTools, ...regularTools, ...oauthTools, ...mcpTools];
+  }
+
+  /**
+   * List all tools for Copilot agent, including unauthorized tools.
+   * This allows Copilot to generate workflows with tools that require authorization,
+   * even if the user hasn't authorized them yet.
+   */
+  async listAllToolsForCopilot(user: User): Promise<GenericToolset[]> {
+    // Get all authorized/installed tools
+    const authorizedTools = await this.listTools(user, { enabled: true });
+
+    // Get all tool definitions from inventory
+    const allDefinitions = await this.inventoryService.getInventoryDefinitions();
+
+    // Get installed toolset keys for filtering
+    const installedKeys = new Set(
+      authorizedTools.map((t) => t.toolset?.key).filter((key): key is string => !!key),
+    );
+
+    // Find unauthorized OAuth tools that should be exposed
+    const unauthorizedDefinitions = allDefinitions.filter(
+      (def) => this.shouldExposeToolset(def) && def.requiresAuth && !installedKeys.has(def.key),
+    );
+
+    // Convert unauthorized definitions to GenericToolset format
+    const unauthorizedTools: GenericToolset[] = unauthorizedDefinitions.map((def) => ({
+      type: 'external_oauth' as const,
+      id: def.key,
+      name: (def.labelDict?.en as string) || def.key,
+      toolset: {
+        toolsetId: def.key,
+        key: def.key,
+        name: (def.labelDict?.en as string) || def.key,
+        definition: def,
+      },
+    }));
+
+    // Return all tools: authorized first, then unauthorized
+    return [...authorizedTools, ...unauthorizedTools];
   }
 
   /**
@@ -980,6 +1068,7 @@ export class ToolService {
 
   /**
    * Instantiate toolsets into structured tools, ready to be used in skill invocation.
+   * Returns categorized tools: all, builtIn, and nonBuiltIn.
    */
   async instantiateToolsets(
     user: User,
@@ -989,7 +1078,7 @@ export class ToolService {
       context?: SkillContext;
       canvasId?: string;
     },
-  ): Promise<StructuredToolInterface[]> {
+  ): Promise<InstantiatedTools> {
     const builtinKeys = toolsets
       .filter((t) => t.type === ToolsetType.REGULAR && t.builtin)
       .map((t) => t.id);
@@ -998,8 +1087,11 @@ export class ToolService {
       builtinTools = this.instantiateBuiltinToolsets(user, engine, builtinKeys);
     }
 
+    const copilotToolset = toolsets.find(
+      (t) => t.type === ToolsetType.REGULAR && t.id === 'copilot',
+    );
     let copilotTools: DynamicStructuredTool[] = [];
-    if (toolsets.find((t) => t.type === ToolsetType.REGULAR && t.id === 'copilot')) {
+    if (copilotToolset) {
       copilotTools = this.instantiateCopilotToolsets(user, engine);
     }
 
@@ -1012,13 +1104,34 @@ export class ToolService {
       this.instantiateMcpServers(user, mcpServers),
       this.composioService.instantiateToolsets(user, toolsets, 'oauth'),
     ]);
-    return [
-      ...builtinTools,
-      ...copilotTools,
+
+    // Categorize tools: builtIn (builtin + copilot) and nonBuiltIn (regular + MCP + OAuth)
+    const builtIn = [...builtinTools, ...copilotTools];
+    const nonBuiltIn = [
       ...(Array.isArray(regularTools) ? regularTools : []),
       ...(Array.isArray(mcpTools) ? mcpTools : []),
       ...(Array.isArray(oauthToolsets) ? oauthToolsets : []),
     ];
+    const all = [...builtIn, ...nonBuiltIn];
+
+    // Categorize toolsets: builtIn and nonBuiltIn
+    const builtInToolsets = toolsets.filter(
+      (t) => (t.type === ToolsetType.REGULAR && t.builtin) || t.id === 'copilot',
+    );
+    const nonBuiltInToolsets = toolsets.filter(
+      (t) =>
+        (t.type === ToolsetType.REGULAR && !t.builtin && t.id !== 'copilot') ||
+        t.type === ToolsetType.MCP ||
+        t.type === ToolsetType.EXTERNAL_OAUTH,
+    );
+
+    return {
+      all,
+      builtIn,
+      nonBuiltIn,
+      builtInToolsets,
+      nonBuiltInToolsets,
+    };
   }
 
   /**
@@ -1063,6 +1176,11 @@ export class ToolService {
     const patchWorkflow = new PatchWorkflow(params);
     const getWorkflowSummary = new GetWorkflowSummary(params);
 
+    // Add read_file and list_files tools for Copilot to directly read file content
+    const builtinToolset = new BuiltinToolset(params);
+    const readFileTool = builtinToolset.getToolInstance('read_file');
+    const listFilesTool = builtinToolset.getToolInstance('list_files');
+
     return [
       new DynamicStructuredTool({
         name: 'copilot_generate_workflow',
@@ -1098,6 +1216,30 @@ export class ToolService {
           type: 'copilot',
           toolsetKey: 'copilot',
           toolsetName: 'Copilot',
+        },
+      }),
+      new DynamicStructuredTool({
+        name: 'copilot_read_file',
+        description: readFileTool.description,
+        schema: readFileTool.schema,
+        func: readFileTool.invoke.bind(readFileTool),
+        metadata: {
+          name: readFileTool.name,
+          type: 'copilot',
+          toolsetKey: readFileTool.toolsetKey,
+          toolsetName: 'Read File',
+        },
+      }),
+      new DynamicStructuredTool({
+        name: 'copilot_list_files',
+        description: listFilesTool.description,
+        schema: listFilesTool.schema,
+        func: listFilesTool.invoke.bind(listFilesTool),
+        metadata: {
+          name: listFilesTool.name,
+          type: 'copilot',
+          toolsetKey: listFilesTool.toolsetKey,
+          toolsetName: 'List Files',
         },
       }),
     ];
@@ -1383,5 +1525,243 @@ export class ToolService {
       updatedAt: toolCallResult.updatedAt.getTime(),
       deletedAt: toolCallResult.deletedAt?.getTime(),
     };
+  }
+
+  /**
+   * Resolve inventory keys to GenericToolset objects for CLI usage.
+   * Accepts inventory keys (e.g., 'tavily', 'fal_audio') and resolves them to
+   * proper toolset IDs and GenericToolset objects.
+   *
+   * Resolution order:
+   * 1. Check if it's already a toolset ID (starts with 'ts-')
+   * 2. Check user's installed toolsets by inventory key
+   * 3. Check global toolsets by key pattern (ts-global-{key})
+   * 4. Return null if not found
+   *
+   * @param user - Current user
+   * @param keys - Array of inventory keys or toolset IDs
+   * @returns Array of resolved GenericToolset objects
+   */
+  async resolveToolsetsByKeys(
+    user: User,
+    keys: string[],
+  ): Promise<{ resolved: GenericToolset[]; errors: Array<{ key: string; reason: string }> }> {
+    const resolved: GenericToolset[] = [];
+    const errors: Array<{ key: string; reason: string }> = [];
+
+    for (const key of keys) {
+      try {
+        const toolset = await this.resolveToolsetByKey(user, key);
+        if (toolset) {
+          resolved.push(toolset);
+        } else {
+          errors.push({ key, reason: 'Toolset not found' });
+        }
+      } catch (error) {
+        errors.push({ key, reason: (error as Error).message });
+      }
+    }
+
+    return { resolved, errors };
+  }
+
+  /**
+   * Resolve a single inventory key to GenericToolset
+   *
+   * Resolution order:
+   * 1. Check user's personal toolsets in toolsets table (by key)
+   * 2. Check global toolsets in toolsets table (by key + isGlobal: true)
+   * 3. Check inventory (for tools that may need authorization)
+   */
+  async resolveToolsetByKey(user: User, key: string): Promise<GenericToolset | null> {
+    // Normalize key: replace hyphens with underscores for lookup
+    const normalizedKey = key.replace(/-/g, '_');
+
+    // Step 1: Check user's personal toolsets by key
+    const userToolset = await this.prisma.toolset.findFirst({
+      where: {
+        uid: user.uid,
+        key: normalizedKey,
+        enabled: true,
+        deletedAt: null,
+      },
+    });
+
+    if (userToolset) {
+      const inventoryItem = await this.inventoryService.getInventoryItem(normalizedKey);
+      const inventoryMap = inventoryItem ? { [normalizedKey]: inventoryItem } : undefined;
+      return toolsetPo2GenericToolset(userToolset, inventoryMap);
+    }
+
+    // Step 2: Check global toolsets by key with isGlobal flag
+    const globalToolset = await this.prisma.toolset.findFirst({
+      where: {
+        key: normalizedKey,
+        isGlobal: true,
+        enabled: true,
+        deletedAt: null,
+      },
+    });
+
+    if (globalToolset) {
+      const inventoryItem = await this.inventoryService.getInventoryItem(normalizedKey);
+      const inventoryMap = inventoryItem ? { [normalizedKey]: inventoryItem } : undefined;
+      return toolsetPo2GenericToolset(globalToolset, inventoryMap);
+    }
+
+    // Step 3: Check builtin tools by name (like generate_doc, send_email, etc.)
+    const builtinItem = builtinToolsetInventory[normalizedKey];
+    if (builtinItem) {
+      const definition = builtinItem.definition;
+      return {
+        type: ToolsetType.REGULAR,
+        id: normalizedKey,
+        name: (definition.labelDict?.en as string) || normalizedKey,
+        builtin: true,
+        toolset: {
+          toolsetId: normalizedKey,
+          name: (definition.labelDict?.en as string) || normalizedKey,
+          key: normalizedKey,
+        },
+      };
+    }
+
+    // Step 4: Check inventory (for tools that may need authorization)
+    const inventoryItem = await this.inventoryService.getInventoryItem(normalizedKey);
+    if (!inventoryItem) {
+      return null;
+    }
+
+    const definition = inventoryItem.definition;
+    const inventoryType = definition.type;
+    const inventoryMap = { [normalizedKey]: inventoryItem };
+
+    // For external_oauth type, check if user has authorized
+    if (inventoryType === 'external_oauth') {
+      // Check composio_connections for OAuth authorization
+      const connection = await this.prisma.composioConnection.findFirst({
+        where: {
+          uid: user.uid,
+          integrationId: normalizedKey,
+          status: 'active',
+          deletedAt: null,
+        },
+      });
+
+      if (connection) {
+        // User has authorized, find their toolset
+        const authorizedToolset = await this.prisma.toolset.findFirst({
+          where: {
+            uid: user.uid,
+            key: normalizedKey,
+            enabled: true,
+            deletedAt: null,
+          },
+        });
+        if (authorizedToolset) {
+          return toolsetPo2GenericOAuthToolset(authorizedToolset, inventoryMap);
+        }
+      }
+
+      // Return null for unauthorized OAuth toolset - user needs to authorize first
+      return null;
+    }
+
+    // If inventory exists but no toolset found, return a basic GenericToolset
+    // This allows the CLI to reference the toolset by key even if not installed
+    return {
+      type: ToolsetType.REGULAR,
+      id: normalizedKey,
+      name: (definition.labelDict?.en as string) || normalizedKey,
+      toolset: {
+        toolsetId: normalizedKey,
+        name: (definition.labelDict?.en as string) || normalizedKey,
+        key: normalizedKey,
+        isGlobal: true,
+        enabled: true,
+        authType: 'config_based' as const,
+        config: null,
+        definition: definition,
+        createdAt: new Date().toJSON(),
+        updatedAt: new Date().toJSON(),
+      },
+    };
+  }
+
+  /**
+   * List all available inventory keys for CLI reference
+   */
+  async listInventoryKeys(): Promise<
+    Array<{
+      key: string;
+      name: string;
+      type: string;
+      requiresAuth: boolean;
+    }>
+  > {
+    const inventoryMap = await this.inventoryService.getInventoryMap();
+    return Object.entries(inventoryMap)
+      .filter(([, item]) => this.shouldExposeToolset(item.definition))
+      .map(([key, item]) => ({
+        key,
+        name: (item.definition.labelDict?.en as string) || key,
+        type: item.definition.type || 'regular',
+        requiresAuth: item.definition.requiresAuth || false,
+      }))
+      .sort((a, b) => a.key.localeCompare(b.key));
+  }
+
+  /**
+   * List all available tool keys for CLI reference
+   * Includes both global tools from toolsets table and inventory tools
+   */
+  async listInventoryKeysForCli(): Promise<
+    Array<{
+      key: string;
+      name: string;
+      type: string;
+      requiresAuth: boolean;
+    }>
+  > {
+    const resultMap = new Map<
+      string,
+      { key: string; name: string; type: string; requiresAuth: boolean }
+    >();
+
+    // 1. Get global tools from toolsets table (including builtin tools)
+    const globalToolsets = await this.prisma.toolset.findMany({
+      where: {
+        isGlobal: true,
+        enabled: true,
+        deletedAt: null,
+      },
+    });
+
+    const inventoryMap = await this.inventoryService.getInventoryMap();
+    for (const toolset of globalToolsets) {
+      const invItem = toolset.key ? inventoryMap[toolset.key] : undefined;
+      if (toolset.key && this.shouldExposeToolset(invItem?.definition)) {
+        resultMap.set(toolset.key, {
+          key: toolset.key,
+          name: toolset.name || toolset.key,
+          type: toolset.authType || 'regular',
+          requiresAuth: false, // Global toolsets are already available
+        });
+      }
+    }
+
+    // 2. Get tools from inventory (external OAuth tools, may need authorization)
+    for (const [key, item] of Object.entries(inventoryMap)) {
+      if (this.shouldExposeToolset(item.definition) && !resultMap.has(key)) {
+        resultMap.set(key, {
+          key,
+          name: (item.definition.labelDict?.en as string) || key,
+          type: item.definition.type || 'regular',
+          requiresAuth: item.definition.requiresAuth || false,
+        });
+      }
+    }
+
+    return Array.from(resultMap.values()).sort((a, b) => a.key.localeCompare(b.key));
   }
 }

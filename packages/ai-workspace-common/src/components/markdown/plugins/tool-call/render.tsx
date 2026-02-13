@@ -1,16 +1,20 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
+import { message } from 'antd';
 import type { DriveFile, WorkflowPlan } from '@refly/openapi-schema';
 
 import { MarkdownMode } from '../../types';
 import { ToolCallStatus, parseToolCallStatus } from './types';
 import { CopilotWorkflowPlan } from './copilot-workflow-plan';
 import { safeParseJSON } from '@refly/utils/parse';
-import { InternalToolRenderer } from './internal-tool-renderers';
+import { InternalToolRenderer, INTERNAL_TOOL_KEYS } from './internal-tool-renderers';
 import { ProductCard } from './product-card';
 import { ToolsetIcon } from '@refly-packages/ai-workspace-common/components/canvas/common/toolset-icon';
 import { Button, Typography } from 'antd';
 import { Spin } from '@refly-packages/ai-workspace-common/components/common/spin';
+import { useCanvasContext } from '@refly-packages/ai-workspace-common/context/canvas';
+import getClient from '@refly-packages/ai-workspace-common/requests/proxiedRequest';
+import { useQueryClient } from '@tanstack/react-query';
 
 import { ArrowDown, ArrowUp, Cancelled, CheckCircleBroken } from 'refly-icons';
 import {
@@ -41,6 +45,7 @@ interface ToolCallProps {
   'data-tool-video-name'?: string;
   'data-tool-video-format'?: string;
   'data-tool-error'?: string;
+  'data-tool-is-ptc'?: string;
   id?: string;
   mode?: MarkdownMode;
 }
@@ -53,6 +58,72 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
   const { t, i18n } = useTranslation();
   const currentLanguage = i18n.language || 'en';
   const [isCollapsed, setIsCollapsed] = useState(true);
+
+  // Get canvas context for adding files to library (optional)
+  const ctx = useCanvasContext(true);
+  const canvasId = ctx?.canvasId;
+
+  const queryClient = useQueryClient();
+
+  // Handle adding file to file library
+  const handleAddToFileLibrary = useCallback(
+    async (file: DriveFile) => {
+      if (!canvasId || !file?.storageKey) {
+        message.error(t('common.saveFailed') || 'Failed to add file to library');
+        return;
+      }
+
+      try {
+        const { data, error } = await getClient().createDriveFile({
+          body: {
+            canvasId,
+            name: file.name ?? 'Untitled file',
+            type: file.type ?? 'text/plain',
+            storageKey: file.storageKey,
+            source: 'manual',
+            summary: file.summary,
+          },
+        });
+
+        if (error || !data?.success) {
+          throw new Error(error ? String(error) : 'Failed to create drive file');
+        }
+
+        // Refetch only file library queries (source: 'manual') to refresh the file list
+        // Using refetchQueries instead of invalidateQueries to avoid clearing cache
+        // This will trigger a refetch in FileOverview component without affecting other queries
+        if (canvasId) {
+          queryClient.refetchQueries({
+            predicate: (query) => {
+              const queryKey = query.queryKey;
+              // Check if this is a ListDriveFiles query
+              if (queryKey[0] !== 'ListDriveFiles') {
+                return false;
+              }
+              // Check if the query has source: 'manual'
+              // Query key structure: ['ListDriveFiles', { query: { canvasId, source, ... } }]
+              const queryOptions = queryKey[1] as
+                | { query?: { source?: string; canvasId?: string } }
+                | undefined;
+              return (
+                queryOptions?.query?.source === 'manual' &&
+                queryOptions?.query?.canvasId === canvasId
+              );
+            },
+          });
+        }
+
+        message.success(
+          t('canvas.workflow.run.addToFileLibrarySuccess') || 'Successfully added to file',
+        );
+      } catch (err) {
+        console.error('Failed to add file to library:', err);
+        message.error(t('common.saveFailed') || 'Failed to add file to library');
+        throw err;
+      }
+    },
+    [canvasId, t, queryClient],
+  );
 
   // Extract tool call ID
   const toolCallId = props['data-tool-call-id'];
@@ -97,13 +168,24 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
     ToolCallStatus.EXECUTING;
 
   // Format the content for parameters
+  // Note: input field has inconsistent formats across different call types:
+  // - old style: nested JSON string {"input": "{\"key\":\"value\"}"}
+  // - new style: flat object {"input": {"key": "value"}}
   const parametersContent = useMemo(() => {
     // First try props data
     if (props['data-tool-arguments']) {
       try {
         const argsStr = props['data-tool-arguments'];
         const args = JSON.parse(argsStr);
-        return JSON.parse(args?.input ?? '{}');
+        const input = args?.input;
+
+        // Handle both formats: string (old style) or object (new style)
+        if (typeof input === 'string') {
+          return JSON.parse(input);
+        } else if (typeof input === 'object' && input !== null) {
+          return input;
+        }
+        return {};
       } catch {
         // Fall through to API data
       }
@@ -111,7 +193,16 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
 
     // Fall back to API data
     if (fetchedData?.data?.result?.input) {
-      return fetchedData.data.result.input;
+      const input = fetchedData.data.result.input;
+      // Also handle both formats for API data
+      if (typeof input === 'string') {
+        try {
+          return JSON.parse(input);
+        } catch {
+          return {};
+        }
+      }
+      return input;
     }
 
     return {};
@@ -237,20 +328,26 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
       const resultStr = props['data-tool-result'] ?? '{}';
       const structuredArgs = safeParseJSON(resultStr)?.data as WorkflowPlan;
 
-      // Handle case when structuredArgs is undefined
-      if (!structuredArgs) {
+      // Handle case when structuredArgs is undefined or status is failed
+      if (!structuredArgs || toolCallStatus === ToolCallStatus.FAILED) {
         return (
-          <div className="border-t border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 py-2">
-            <div className="rounded-md bg-gray-100 dark:bg-gray-700 px-4 py-3 text-xs font-normal whitespace-pre-wrap text-gray-800 dark:text-gray-200 leading-[22px]">
-              {toolCallStatus === ToolCallStatus.EXECUTING
-                ? t('components.markdown.workflow.generating')
-                : t('components.markdown.workflow.invalidData')}
-            </div>
-          </div>
+          <CopilotWorkflowPlan
+            data={structuredArgs ?? { title: '', tasks: [] }}
+            status={toolCallStatus}
+            error={errorMessage ?? undefined}
+            toolName={toolName}
+          />
         );
       }
 
-      return <CopilotWorkflowPlan data={structuredArgs} />;
+      return (
+        <CopilotWorkflowPlan
+          data={structuredArgs}
+          status={toolCallStatus}
+          error={errorMessage ?? undefined}
+          toolName={toolName}
+        />
+      );
     }
 
     if (toolName === 'get_workflow_summary') {
@@ -260,6 +357,21 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
           toolCallStatus={toolCallStatus}
           durationText={durationText}
           parametersContent={parametersContent}
+        />
+      );
+    }
+
+    // Handle copilot file tools (read_file, list_files) - reuse InternalToolRenderer
+    // Use toolName as the key to match the renderer registry
+    if (INTERNAL_TOOL_KEYS.includes(toolName)) {
+      return (
+        <InternalToolRenderer
+          toolsetKey={toolName}
+          toolsetName={toolName}
+          toolCallStatus={toolCallStatus}
+          durationText={durationText}
+          parametersContent={parametersContent as Record<string, unknown>}
+          resultContent={resultContentParsed}
         />
       );
     }
@@ -282,6 +394,8 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
           canvasId: String(file.canvasId ?? ''),
           name: String(file.name ?? file.fileName ?? 'Drive file'),
           type: String(file.type ?? file.mimeType ?? 'application/octet-stream'),
+          storageKey: file.storageKey,
+          summary: file.summary,
         }));
     }
 
@@ -292,6 +406,8 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
           canvasId: String(resultData.canvasId ?? ''),
           name: String(resultData.name ?? resultData.fileName ?? 'Drive file'),
           type: String(resultData.type ?? resultData.mimeType ?? 'application/octet-stream'),
+          storageKey: resultData.storageKey,
+          summary: resultData.summary,
         },
       ];
     }
@@ -303,6 +419,9 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
     return filePreviewDriveFile.length > 0;
   }, [filePreviewDriveFile]);
 
+  // Check if this is a PTC tool call
+  const isPtc = props['data-tool-is-ptc'] === 'true';
+
   const { data } = useListToolsetInventory({}, null, {
     enabled: true,
   });
@@ -310,7 +429,9 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
   const toolsetName = toolsetDefinition?.labelDict?.[currentLanguage] ?? toolsetKey;
 
   // Compact rendering for internal/system-level tools (read_file, list_files)
-  const isInternalTool = toolsetDefinition?.internal === true;
+  // Use INTERNAL_TOOL_KEYS directly instead of relying on API data, since internal tools
+  // are filtered out by shouldExposeToolset and won't be returned by /tool/inventory/list
+  const isInternalTool = INTERNAL_TOOL_KEYS.includes(toolsetKey);
   if (isInternalTool) {
     return (
       <InternalToolRenderer
@@ -326,7 +447,12 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
 
   return (
     <>
-      <div className="rounded-lg overflow-hidden bg-refly-bg-control-z0 text-refly-text-0">
+      <div
+        className={cn(
+          'rounded-lg overflow-hidden bg-refly-bg-control-z0 text-refly-text-0',
+          isPtc && 'ml-4',
+        )}
+      >
         {/* Header bar */}
         <div
           className="flex items-center justify-between p-3 gap-3 cursor-pointer select-none min-h-[48px] transition-all duration-200"
@@ -481,7 +607,13 @@ const ToolCall: React.FC<ToolCallProps> = (props) => {
 
       {shouldRenderFilePreview &&
         filePreviewDriveFile.map((file) => (
-          <ProductCard key={file.fileId} file={file} source="card" classNames="mt-3" />
+          <ProductCard
+            key={file.fileId}
+            file={file}
+            source="card"
+            classNames="mt-3"
+            onAddToFileLibrary={canvasId ? handleAddToFileLibrary : undefined}
+          />
         ))}
     </>
   );

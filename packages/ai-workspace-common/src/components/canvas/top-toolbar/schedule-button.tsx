@@ -1,6 +1,6 @@
 import { useRef } from 'react';
 import { memo, useState, useCallback, useEffect, useMemo } from 'react';
-import { Button, Tooltip, Popover, message, Modal } from 'antd';
+import { Button, Popover, message, Modal, Tooltip } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { cn } from '@refly/utils/cn';
@@ -9,15 +9,30 @@ import {
   useCreateSchedule,
   useUpdateSchedule,
   useGetCreditUsageByCanvasId,
+  useListUserTools,
+  useGetCanvasData,
 } from '@refly-packages/ai-workspace-common/queries';
 import { useSkillResponseLoadingStatus } from '@refly-packages/ai-workspace-common/hooks/canvas/use-skill-response-loading-status';
-import { useCanvasStoreShallow, useSubscriptionStoreShallow } from '@refly/stores';
+import {
+  useCanvasStoreShallow,
+  useSubscriptionStoreShallow,
+  useUserStoreShallow,
+  useCanvasResourcesPanelStoreShallow,
+} from '@refly/stores';
 import { logEvent } from '@refly/telemetry-web';
-import type { WorkflowSchedule, ListSchedulesResponse } from '@refly/openapi-schema';
+import type {
+  WorkflowSchedule,
+  ListSchedulesResponse,
+  GenericToolset,
+  UserTool,
+} from '@refly/openapi-schema';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 import timezone from 'dayjs/plugin/timezone';
 import { LuAlarmClock } from 'react-icons/lu';
+import { extractToolsetsWithNodes } from '@refly/canvas-common';
+import { useSubscriptionUsage } from '@refly-packages/ai-workspace-common/hooks/use-subscription-usage';
+import { useRequiredInputsCheck } from '@refly-packages/ai-workspace-common/components/canvas/tools-dependency';
 import {
   SchedulePopoverContent,
   parseScheduleConfig,
@@ -30,32 +45,91 @@ import './index.scss';
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
+/**
+ * Check if a toolset is authorized/installed
+ * - External OAuth tools: need authorization (check userTools.authorized)
+ * - Other tools (builtin, non-OAuth): always available, no installation needed
+ */
+const isToolsetAuthorized = (toolset: GenericToolset, userTools: UserTool[]): boolean => {
+  // MCP servers need to be checked separately
+  if (toolset.type === 'mcp') {
+    return userTools.some((t) => t.toolset?.name === toolset.name);
+  }
+
+  // Builtin tools are always available
+  if (toolset.builtin) {
+    return true;
+  }
+
+  // Find matching user tool by key
+  const matchingUserTool = userTools.find((t) => t.key === toolset.toolset?.key);
+
+  // If not in userTools list, user hasn't installed/authorized this tool
+  if (!matchingUserTool) {
+    return false;
+  }
+
+  // For external OAuth tools, check authorized status
+  return matchingUserTool.authorized ?? false;
+};
+
 interface ScheduleButtonProps {
   canvasId: string;
+  className?: string;
 }
 
-const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
+const ScheduleButton = memo(({ canvasId, className }: ScheduleButtonProps) => {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
+
   const [scheduleLimitModalVisible, setScheduleLimitModalVisible] = useState(false);
   const [deactivateModalVisible, setDeactivateModalVisible] = useState(false);
-  const [isHovered, setIsHovered] = useState(false);
 
   // Local state for popover form
   const [schedule, setSchedule] = useState<WorkflowSchedule | null>(null);
   const [isEnabled, setIsEnabled] = useState(false);
+  const [isEnabledLoading, setIsEnabledLoading] = useState(false);
+
   const [frequency, setFrequency] = useState<ScheduleFrequency>('daily');
   const [timeValue, setTimeValue] = useState<dayjs.Dayjs>(dayjs('08:00', 'HH:mm'));
 
   const [weekdays, setWeekdays] = useState<number[]>([1]);
   const [monthDays, setMonthDays] = useState<number[]>([1]);
+  const [hours, setHours] = useState<number>(1);
 
   // Get subscription plan type and credit insufficient modal setter
   const { planType, setCreditInsufficientModalVisible } = useSubscriptionStoreShallow((state) => ({
     planType: state.planType,
     setCreditInsufficientModalVisible: state.setCreditInsufficientModalVisible,
   }));
+
+  // Get user login status for dependency checks
+  const { isLogin } = useUserStoreShallow((state) => ({
+    isLogin: state.isLogin,
+  }));
+
+  // Get tools dependency store for triggering popover
+  const { setToolsDependencyOpen, setToolsDependencyHighlight } =
+    useCanvasResourcesPanelStoreShallow((state) => ({
+      setToolsDependencyOpen: state.setToolsDependencyOpen,
+      setToolsDependencyHighlight: state.setToolsDependencyHighlight,
+    }));
+
+  // Get canvas data for dependency checks
+  const { data: canvasResponse } = useGetCanvasData({ query: { canvasId } }, [], {
+    enabled: !!canvasId && isLogin,
+    refetchOnWindowFocus: false,
+  });
+
+  // Get user tools for dependency checks
+  const { data: userToolsData } = useListUserTools({}, [], {
+    enabled: isLogin,
+    refetchOnWindowFocus: false,
+  });
+
+  // Get credit balance for dependency checks
+  const { creditBalance, isBalanceSuccess } = useSubscriptionUsage();
 
   // API mutations
   const listSchedulesMutation = useListSchedules();
@@ -66,6 +140,7 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
   const [totalEnabledSchedules, setTotalEnabledSchedules] = useState(0);
   const [isLoadingScheduleCount, setIsLoadingScheduleCount] = useState(false);
   const [hasLoadedInitially, setHasLoadedInitially] = useState(false);
+  const [isDeactivating, setIsDeactivating] = useState(false);
 
   // Calculate schedule quota based on plan type
   const scheduleQuota = useMemo(() => {
@@ -104,6 +179,55 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
   const disabled = useMemo(() => {
     return toolbarLoading || !skillResponseNodes?.length;
   }, [toolbarLoading, skillResponseNodes]);
+
+  // Check for required inputs that are not filled
+  const { count: requiredInputsCount } = useRequiredInputsCheck(canvasId);
+
+  // Check for tool dependencies and errors
+  const hasToolDependencyError = useMemo(() => {
+    if (!isLogin || !schedule?.isEnabled) {
+      return false;
+    }
+
+    const nodes = canvasResponse?.data?.nodes || [];
+    const userTools = userToolsData?.data ?? [];
+
+    // Extract toolsets from canvas nodes
+    const toolsetsWithNodes = extractToolsetsWithNodes(nodes);
+
+    // Check for uninstalled tools
+    const uninstalledTools = toolsetsWithNodes.filter((tool) => {
+      const isAuthorized = isToolsetAuthorized(tool.toolset, userTools);
+      return !isAuthorized;
+    });
+
+    const hasUninstalledTools = uninstalledTools.length > 0;
+
+    // Check for credit insufficiency
+    const estimatedCreditUsage = creditUsageData?.data?.total ?? 0;
+    const isCreditInsufficient =
+      isBalanceSuccess &&
+      Number.isFinite(estimatedCreditUsage) &&
+      estimatedCreditUsage > 0 &&
+      creditBalance < estimatedCreditUsage;
+
+    // Check for unfilled required inputs
+    const hasUnfilledRequiredInputs = requiredInputsCount > 0;
+
+    const hasError = hasUninstalledTools || isCreditInsufficient || hasUnfilledRequiredInputs;
+
+    return hasError;
+  }, [
+    isLogin,
+    schedule?.isEnabled,
+    schedule?.scheduleId,
+    canvasResponse?.data?.nodes,
+    userToolsData?.data,
+    creditUsageData?.data?.total,
+    isBalanceSuccess,
+    creditBalance,
+    requiredInputsCount,
+  ]);
 
   // Fetch all enabled schedules count
   const fetchAllEnabledSchedulesCount = useCallback(async () => {
@@ -186,9 +310,10 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
           setTimeValue(serverTime);
         }
 
-        // Only update weekdays/monthDays if they're actually different
+        // Only update weekdays/monthDays/hours if they're actually different
         const serverWeekdays = config?.weekdays || [1];
         const serverMonthDays = config?.monthDays || [1];
+        const serverHours = config?.hours || 1;
         const currentWeekdaysStr = JSON.stringify(weekdays.sort());
         const currentMonthDaysStr = JSON.stringify(monthDays.sort());
         const serverWeekdaysStr = JSON.stringify(serverWeekdays.sort());
@@ -199,6 +324,9 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
         }
         if (currentMonthDaysStr !== serverMonthDaysStr) {
           setMonthDays(serverMonthDays);
+        }
+        if (hours !== serverHours) {
+          setHours(serverHours);
         }
       }
     } catch (error) {
@@ -238,6 +366,7 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
           time: timeStr,
           ...(frequency === 'weekly' && { weekdays }),
           ...(frequency === 'monthly' && { monthDays }),
+          ...(frequency === 'hourly' && { hours }),
         };
 
         const cronExpression = generateCronExpression(scheduleConfig);
@@ -245,7 +374,7 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
 
         const requestData = {
           canvasId,
-          name: `Schedule for ${canvasId}`,
+          name: canvasResponse?.data?.title ?? '',
           cronExpression,
           scheduleConfig: scheduleConfigStr,
           timezone: userTimezone,
@@ -307,6 +436,7 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
       timeValue,
       weekdays,
       monthDays,
+      hours,
       createScheduleMutation,
       updateScheduleMutation,
       fetchSchedule,
@@ -314,34 +444,127 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
     ],
   );
 
+  // Immediate dependency check function (without waiting for schedule to be enabled)
+  const checkDependenciesImmediately = useCallback(() => {
+    if (!isLogin) {
+      return false;
+    }
+
+    const nodes = canvasResponse?.data?.nodes || [];
+    const userTools = userToolsData?.data ?? [];
+
+    // Extract toolsets from canvas nodes
+    const toolsetsWithNodes = extractToolsetsWithNodes(nodes);
+
+    // Check for uninstalled tools
+    const uninstalledTools = toolsetsWithNodes.filter((tool) => {
+      const isAuthorized = isToolsetAuthorized(tool.toolset, userTools);
+      return !isAuthorized;
+    });
+
+    const hasUninstalledTools = uninstalledTools.length > 0;
+
+    // Check for credit insufficiency
+    const estimatedCreditUsage = creditUsageData?.data?.total ?? 0;
+    const isCreditInsufficient =
+      isBalanceSuccess &&
+      Number.isFinite(estimatedCreditUsage) &&
+      estimatedCreditUsage > 0 &&
+      creditBalance < estimatedCreditUsage;
+
+    // Check for unfilled required inputs
+    const hasUnfilledRequiredInputs = requiredInputsCount > 0;
+
+    const hasError = hasUninstalledTools || isCreditInsufficient || hasUnfilledRequiredInputs;
+
+    return hasError;
+  }, [
+    isLogin,
+    canvasResponse?.data?.nodes,
+    userToolsData?.data,
+    creditUsageData?.data?.total,
+    isBalanceSuccess,
+    creditBalance,
+    requiredInputsCount,
+  ]);
+
   // Handle switch change with auto save and deactivate confirmation
   const handleSwitchChange = useCallback(
     async (checked: boolean) => {
       if (checked) {
-        // Enabling: auto save immediately
-        setIsEnabled(true);
-        await autoSave(true);
-        // Refresh schedule data after enabling
-        await fetchSchedule();
-        message.success(t('schedule.saveSuccess') || 'Schedule saved');
+        try {
+          // Start loading immediately
+          setIsEnabledLoading(true);
+
+          // Check for dependency errors BEFORE enabling (immediate check)
+          const hasDependencyError = checkDependenciesImmediately();
+
+          // Show dependency popover if there are issues (but don't block enabling)
+          if (hasDependencyError) {
+            setOpen(false); // Close schedule popover first
+            setToolsDependencyOpen(canvasId, true); // Open tools dependency popover
+            setToolsDependencyHighlight(canvasId, true); // Highlight install buttons
+          }
+
+          // Enabling: auto save immediately (continue regardless of dependency errors)
+          setIsEnabled(true);
+          await autoSave(true);
+          // Refresh schedule data after enabling
+          await fetchSchedule();
+
+          // Show message after all async operations complete
+          if (hasDependencyError) {
+            message.warning(t('schedule.dependencyError') || 'Schedule has dependency errors');
+          } else {
+            message.success(t('schedule.saveSuccess') || 'Schedule saved');
+          }
+        } catch (error) {
+          console.error('Error enabling schedule:', error);
+          message.error(t('schedule.saveFailed') || 'Failed to save schedule');
+          // Reset enabled state if error occurs
+          setIsEnabled(false);
+        } finally {
+          // End loading after all operations and message display
+          setIsEnabledLoading(false);
+        }
       } else {
         // Disabling: show confirmation modal and close popover
         setOpen(false);
         setDeactivateModalVisible(true);
       }
     },
-    [autoSave, fetchSchedule, t],
+    [
+      checkDependenciesImmediately,
+      autoSave,
+      fetchSchedule,
+      t,
+      canvasId,
+      setToolsDependencyOpen,
+      setToolsDependencyHighlight,
+    ],
   );
 
   // Handle confirmed deactivation
   const handleConfirmDeactivate = useCallback(async () => {
-    setIsEnabled(false);
-    await autoSave(false);
-    // Refresh schedule data after deactivating
-    await fetchSchedule();
-    setDeactivateModalVisible(false);
-    message.success(t('schedule.deactivateSuccess') || 'Schedule deactivated');
-  }, [autoSave, fetchSchedule, t]);
+    if (isDeactivating) return; // Prevent multiple clicks
+
+    try {
+      setIsDeactivating(true);
+      setIsEnabled(false);
+      await autoSave(false);
+      // Refresh schedule data after deactivating
+      await fetchSchedule();
+      setDeactivateModalVisible(false);
+      message.success(t('schedule.deactivateSuccess') || 'Schedule deactivated');
+    } catch (error) {
+      console.error('Error deactivating schedule:', error);
+      message.error(t('schedule.deactivateError') || 'Failed to deactivate schedule');
+      // Reset enabled state if error occurs
+      setIsEnabled(true);
+    } finally {
+      setIsDeactivating(false);
+    }
+  }, [autoSave, fetchSchedule, t, isDeactivating]);
 
   // Handle auto save when other settings change (if enabled)
   // Use ref to track if we're currently saving to prevent infinite loops
@@ -363,29 +586,12 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
       }, 500); // Debounce auto save
       return () => clearTimeout(timer);
     }
-  }, [frequency, timeValue, weekdays, monthDays, isEnabled, schedule?.scheduleId, autoSave]);
+  }, [frequency, timeValue, weekdays, monthDays, hours, isEnabled, schedule?.scheduleId, autoSave]);
 
   const handleButtonClick = useCallback(() => {
     if (disabled) return;
 
-    logEvent('canvas::schedule_button_click', Date.now(), {
-      canvas_id: canvasId,
-    });
-
-    // Check if this canvas already has an ENABLED schedule (only enabled schedules count toward quota)
-    const hasEnabledSchedule = !!schedule?.isEnabled;
-
-    // If canvas doesn't have enabled schedule and quota is reached, show appropriate modal
-    if (!hasEnabledSchedule && totalEnabledSchedules >= scheduleQuota) {
-      if (planType === 'free') {
-        // Free user: show credit insufficient modal
-        setCreditInsufficientModalVisible(true, undefined, 'schedule');
-      } else {
-        // Paid user: show schedule limit reached modal
-        setScheduleLimitModalVisible(true);
-      }
-      return; // Don't open popover when showing limit modals
-    }
+    logEvent('schedule_entry_click');
 
     // Initialize form state when opening popover
     const config = parseScheduleConfig(schedule?.scheduleConfig);
@@ -394,17 +600,10 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
     setTimeValue(config?.time ? dayjs(config.time, 'HH:mm') : dayjs('08:00', 'HH:mm'));
     setWeekdays(config?.weekdays || [1]);
     setMonthDays(config?.monthDays || [1]);
+    setHours(config?.hours || 1);
 
     setOpen(true);
-  }, [
-    disabled,
-    canvasId,
-    schedule,
-    totalEnabledSchedules,
-    scheduleQuota,
-    planType,
-    setCreditInsufficientModalVisible,
-  ]);
+  }, [disabled, schedule]);
 
   // Handle popover close
   const handleClose = useCallback(() => {
@@ -423,11 +622,23 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
   // Handle view schedules click
   const handleViewSchedulesClick = useCallback(() => {
     setScheduleLimitModalVisible(false);
-    navigate('/workflow-list');
+    navigate('/workflow-list', {
+      state: { autoEnableScheduleFilter: true },
+    });
   }, [navigate]);
 
-  // Determine style based on schedule status
+  // Determine schedule status
   const isScheduled = schedule?.isEnabled;
+  const [isHovered, setIsHovered] = useState(false);
+  const scheduleStatus = useMemo(() => {
+    if (!isScheduled) {
+      return 'off';
+    }
+    if (hasToolDependencyError) {
+      return 'error';
+    }
+    return 'on';
+  }, [isScheduled, hasToolDependencyError, schedule?.scheduleId]);
 
   return (
     <>
@@ -449,26 +660,36 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
             canvasId={canvasId}
             schedule={schedule}
             isEnabled={isEnabled}
+            isEnabledLoading={isEnabledLoading}
             frequency={frequency}
             timeValue={timeValue}
             weekdays={weekdays}
             monthDays={monthDays}
+            hours={hours}
             onEnabledChange={handleSwitchChange}
             onFrequencyChange={setFrequency}
             onTimeChange={setTimeValue}
             onWeekdaysChange={setWeekdays}
             onMonthDaysChange={setMonthDays}
+            onHoursChange={setHours}
             onClose={handleClose}
             creditCost={creditUsageData?.data?.total}
             isCreditLoading={isCreditUsageLoading}
             showUpgrade={planType === 'free'}
             onUpgradeClick={handleUpgradeClick}
+            totalEnabledSchedules={totalEnabledSchedules}
+            scheduleQuota={scheduleQuota}
+            hasLoadedInitially={hasLoadedInitially}
+            isLoadingScheduleCount={isLoadingScheduleCount}
+            planType={planType}
+            setCreditInsufficientModalVisible={setCreditInsufficientModalVisible}
+            setScheduleLimitModalVisible={setScheduleLimitModalVisible}
           />
         }
         trigger="click"
         open={open}
         onOpenChange={handleOpenChange}
-        placement="bottomLeft"
+        placement="bottom"
         overlayClassName="schedule-popover"
       >
         <Tooltip
@@ -486,22 +707,25 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
           }
           placement="top"
         >
-          <div className="flex items-center gap-2">
+          <Button
+            type="text"
+            disabled={disabled}
+            className={cn('schedule-toolbar-button', className)}
+            onClick={handleButtonClick}
+            onMouseEnter={() => setIsHovered(true)}
+            onMouseLeave={() => setIsHovered(false)}
+          >
             <div className="relative">
               <div
                 className={cn(
-                  'rounded-lg p-1.5 transition-colors flex items-center justify-center',
-                  disabled ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-refly-tertiary-hover',
+                  'schedule-toolbar-icon-wrap rounded-lg transition-colors',
+                  disabled ? 'cursor-not-allowed' : 'cursor-pointer',
                 )}
-                onClick={handleButtonClick}
-                onMouseEnter={() => setIsHovered(true)}
-                onMouseLeave={() => setIsHovered(false)}
               >
                 <LuAlarmClock
                   className={cn(
-                    'text-lg transition-colors',
+                    'schedule-toolbar-icon transition-colors',
                     disabled ? 'opacity-50' : '',
-                    'text-gray-600 dark:text-gray-400',
                   )}
                 />
               </div>
@@ -509,17 +733,19 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
                 <div className="absolute -bottom-0 -right-1">
                   <span
                     className={`px-0.5 py-0.5 flex items-center text-[8px] font-bold leading-[8px] rounded-sm ${
-                      isScheduled
+                      scheduleStatus === 'on'
                         ? 'bg-refly-primary-default text-refly-bg-body-z0'
-                        : 'bg-refly-fill-hover text-refly-text-3'
+                        : scheduleStatus === 'error'
+                          ? 'bg-refly-func-danger-default text-refly-bg-body-z0'
+                          : 'bg-refly-fill-hover text-refly-text-3'
                     }`}
                   >
-                    {isScheduled ? t('schedule.status.on') : t('schedule.status.off')}
+                    {t(`schedule.status.${scheduleStatus}`)}
                   </span>
                 </div>
               )}
             </div>
-            <span className="text-xs text-gray-500 dark:text-gray-400 font-medium">
+            <span className="schedule-toolbar-text">
               {!hasLoadedInitially && isLoadingScheduleCount ? (
                 <div className="flex items-center gap-1">
                   <div className="w-2 h-3 bg-gray-300 dark:bg-gray-600 rounded animate-pulse" />
@@ -527,10 +753,14 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
                   <div className="w-2 h-3 bg-gray-300 dark:bg-gray-600 rounded" />
                 </div>
               ) : (
-                `${totalEnabledSchedules}/${scheduleQuota}`
+                <>
+                  <span className="schedule-toolbar-label">
+                    {t('schedule.title') || 'Schedule'}
+                  </span>
+                </>
               )}
             </span>
-          </div>
+          </Button>
         </Tooltip>
       </Popover>
 
@@ -566,17 +796,24 @@ const ScheduleButton = memo(({ canvasId }: ScheduleButtonProps) => {
       <Modal
         title={t('schedule.deactivate.title') || 'Deactivate Schedule'}
         open={deactivateModalVisible}
-        onCancel={() => setDeactivateModalVisible(false)}
+        onCancel={isDeactivating ? undefined : () => setDeactivateModalVisible(false)}
+        closable={!isDeactivating}
+        maskClosable={!isDeactivating}
         centered
+        wrapClassName="deactivate-schedule-modal"
         footer={[
-          <Button key="cancel" onClick={() => setDeactivateModalVisible(false)}>
+          <Button
+            key="cancel"
+            disabled={isDeactivating}
+            onClick={() => setDeactivateModalVisible(false)}
+          >
             {t('common.cancel') || 'Cancel'}
           </Button>,
           <Button
             key="deactivate"
             type="primary"
+            loading={isDeactivating}
             onClick={handleConfirmDeactivate}
-            className="!bg-gray-600 hover:!bg-gray-700 !border-gray-600"
           >
             {t('schedule.deactivate.confirm') || 'Deactivate'}
           </Button>,

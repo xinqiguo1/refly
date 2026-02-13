@@ -11,9 +11,9 @@ import { Queue } from 'bullmq';
 import {
   QUEUE_SCHEDULE_EXECUTION,
   SCHEDULE_JOB_OPTIONS,
-  ScheduleFailureReason,
   ScheduleAnalyticsEvents,
   SchedulePeriodType,
+  ScheduleFailureReason,
   getScheduleQuota,
   getScheduleConfig,
   type ScheduleConfig,
@@ -21,6 +21,7 @@ import {
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { CronExpressionParser } from 'cron-parser';
 import { genScheduleRecordId } from '@refly/utils';
+import { logEvent } from '@refly/telemetry-node';
 
 /**
  * Extract schedule type from scheduleConfig JSON
@@ -114,7 +115,64 @@ export class ScheduleCronService implements OnModuleInit {
     }
   }
 
+  /**
+   * Check and trigger a specific schedule if it's due
+   * This is used to immediately check schedules that were just created/updated
+   * with a near-future nextRunAt to avoid missing the first execution
+   * @param scheduleId - Schedule ID to check
+   * @returns true if schedule was triggered, false otherwise
+   */
+  async checkAndTriggerSchedule(scheduleId: string): Promise<boolean> {
+    const now = new Date();
+
+    // Find the specific schedule
+    const schedule = await this.prisma.workflowSchedule.findFirst({
+      where: {
+        scheduleId,
+        isEnabled: true,
+        deletedAt: null,
+        nextRunAt: { lte: now },
+      },
+    });
+
+    if (!schedule) {
+      return false;
+    }
+
+    try {
+      await this.triggerSchedule(schedule);
+      this.logger.log(`Immediately triggered schedule ${scheduleId} after creation/update`);
+      return true;
+    } catch (error) {
+      this.logger.error(`Failed to immediately trigger schedule ${scheduleId}`, error);
+      return false;
+    }
+  }
+
   private async triggerSchedule(schedule: any) {
+    // Re-check schedule status from database in case it was disabled by another schedule's
+    // quota check in the same batch (the in-memory schedule object may be stale)
+    const freshSchedule = await this.prisma.workflowSchedule.findUnique({
+      where: { scheduleId: schedule.scheduleId },
+      select: { isEnabled: true, deletedAt: true, nextRunAt: true },
+    });
+
+    if (!freshSchedule || !freshSchedule.isEnabled || freshSchedule.deletedAt) {
+      this.logger.debug(
+        `Schedule ${schedule.scheduleId} was disabled/deleted during batch processing, skipping`,
+      );
+      return;
+    }
+
+    // Race condition guard: Check if schedule was already processed by another instance/request
+    // If nextRunAt is in the future, it means another process already triggered it and updated the time
+    if (freshSchedule.nextRunAt && freshSchedule.nextRunAt > new Date()) {
+      this.logger.debug(
+        `Schedule ${schedule.scheduleId} was passed to trigger but nextRunAt is in future (${freshSchedule.nextRunAt.toISOString()}). Skipping to prevent double execution.`,
+      );
+      return;
+    }
+
     // 3.1 Calculate next run time
     let nextRunAt: Date | null = null;
     try {
@@ -155,90 +213,140 @@ export class ScheduleCronService implements OnModuleInit {
       return;
     }
 
-    // 3.1.5 Check Schedule Limit
-    //  Fetch actual limit from subscription plan. Currently mocking Free=1, Plus=20.
+    // 3.1.5 Check Schedule Limit and Concurrency
     const userSubscription = await this.prisma.subscription.findFirst({
       where: { uid: schedule.uid, status: 'active' },
     });
-    // Simple logic: if has active subscription -> 20, else 1
     const limit = getScheduleQuota(userSubscription?.lookupKey, this.scheduleConfig);
 
     const activeSchedulesCount = await this.prisma.workflowSchedule.count({
       where: { uid: schedule.uid, isEnabled: true, deletedAt: null },
     });
 
+    // If user exceeds quota, disable other schedules and send email
     if (activeSchedulesCount > limit) {
-      // Check if this schedule is among the allowed set (earliest created)
-      const allowedSchedules = await this.prisma.workflowSchedule.findMany({
-        where: { uid: schedule.uid, isEnabled: true, deletedAt: null },
-        orderBy: { createdAt: 'asc' },
-        take: limit,
-        select: { scheduleId: true },
+      this.logger.warn(
+        `User ${schedule.uid} has ${activeSchedulesCount} active schedules, exceeding limit of ${limit}`,
+      );
+
+      // Get all active schedules except the current one, ordered by creation time (oldest first)
+      const otherSchedules = await this.prisma.workflowSchedule.findMany({
+        where: {
+          uid: schedule.uid,
+          isEnabled: true,
+          deletedAt: null,
+          scheduleId: { not: schedule.scheduleId },
+        },
+        orderBy: { createdAt: 'desc' }, // Disable newest schedules first
+        select: { scheduleId: true, name: true },
       });
 
-      const isAllowed = allowedSchedules.some((s) => s.scheduleId === schedule.scheduleId);
+      // Calculate how many schedules need to be disabled
+      const schedulesToDisableCount = activeSchedulesCount - limit;
+      const schedulesToDisable = otherSchedules.slice(0, schedulesToDisableCount);
 
-      if (!isAllowed) {
-        this.logger.warn(
-          `Schedule ${schedule.scheduleId} excluded from execution due to limit exceeded (${activeSchedulesCount}/${limit})`,
-        );
+      // Disable excess schedules
+      if (schedulesToDisable.length > 0) {
+        const scheduleIdsToDisable = schedulesToDisable.map((s) => s.scheduleId);
 
-        // Update record to failed if exists (or create one for history)
-        const recordId = genScheduleRecordId();
-        await this.prisma.workflowScheduleRecord.create({
+        await this.prisma.workflowSchedule.updateMany({
+          where: {
+            scheduleId: { in: scheduleIdsToDisable },
+          },
           data: {
-            scheduleRecordId: recordId,
-            scheduleId: schedule.scheduleId,
-            uid: schedule.uid,
-            sourceCanvasId: schedule.canvasId,
-            canvasId: '',
-            workflowTitle: 'Schedule Limit Exceeded',
-            status: 'failed',
-            failureReason: ScheduleFailureReason.SCHEDULE_LIMIT_EXCEEDED,
-            errorDetails: JSON.stringify({
-              message: `Active schedule limit exceeded (${activeSchedulesCount}/${limit}). This schedule is not among the earliest ${limit}.`,
-            }),
-            scheduledAt: schedule.nextRunAt ?? new Date(),
-            triggeredAt: new Date(),
-            completedAt: new Date(),
-            priority: 0,
+            isEnabled: false,
+            nextRunAt: null,
           },
         });
 
-        // Send Email
-        const user = await this.prisma.user.findUnique({ where: { uid: schedule.uid } });
-        if (user?.email) {
-          const { subject, html } = generateLimitExceededEmail({
-            userName: user.nickname || 'User',
-            scheduleName: schedule.name || 'Untitled Schedule',
-            limit,
-            currentCount: activeSchedulesCount,
-            schedulesLink: `${this.config.get<string>('origin')}/workflow/${schedule.canvasId}`,
-          });
+        // Update all WorkflowScheduleRecord for disabled schedules to failed status
+        const now = new Date();
+        const { count } = await this.prisma.workflowScheduleRecord.updateMany({
+          where: {
+            scheduleId: { in: scheduleIdsToDisable },
+            status: { in: ['pending', 'scheduled', 'processing'] }, // Only update records that haven't completed
+          },
+          data: {
+            status: 'failed',
+            failureReason: ScheduleFailureReason.SCHEDULE_LIMIT_EXCEEDED,
+            errorDetails: JSON.stringify({
+              reason: 'Schedule was disabled due to quota exceeded',
+              disabledAt: now.toISOString(),
+            }),
+            completedAt: now,
+          },
+        });
 
-          await this.notificationService.sendEmail(
-            {
-              to: user.email,
-              subject,
-              html,
-            },
-            user,
-          );
+        // Remove pending jobs from BullMQ queue to prevent duplicate failures
+        // This ensures jobs don't run and overwrite the SCHEDULE_LIMIT_EXCEEDED status with SCHEDULE_DISABLED
+        try {
+          const waitingJobs = await this.scheduleQueue.getJobs(['waiting', 'delayed']);
+          let removedJobsCount = 0;
+          for (const job of waitingJobs) {
+            if (job.data?.scheduleId && scheduleIdsToDisable.includes(job.data.scheduleId)) {
+              await job.remove();
+              removedJobsCount++;
+              this.logger.debug(
+                `Removed job ${job.id} for disabled schedule ${job.data.scheduleId}`,
+              );
+            }
+          }
+          if (removedJobsCount > 0) {
+            this.logger.log(`Removed ${removedJobsCount} pending jobs for disabled schedules`);
+          }
+        } catch (queueError) {
+          // Queue operation failure is not critical, jobs will be skipped by processor anyway
+          this.logger.warn('Failed to remove pending jobs for disabled schedules', queueError);
         }
 
-        return; // Skip execution
+        this.logger.log(
+          `Auto-disabled ${schedulesToDisable.length} schedules for user ${schedule.uid} due to quota exceeded, updated ${count} schedule records to failed`,
+        );
+      }
+
+      // Send email notification
+      const user = await this.prisma.user.findUnique({ where: { uid: schedule.uid } });
+      if (user?.email) {
+        const { subject, html } = generateLimitExceededEmail({
+          userName: user.nickname || 'User',
+          scheduleName: schedulesToDisable.map((s) => s.name).join(', ') || 'Untitled Schedule',
+          limit,
+          currentCount: activeSchedulesCount,
+          schedulesLink: `${this.config.get<string>('origin')}/workflow-list`,
+        });
+
+        await this.notificationService.sendEmail(
+          {
+            to: user.email,
+            subject,
+            html,
+          },
+          user,
+        );
       }
     }
 
     // 3.2 Update schedule with next run time (Optimistic locking via updateMany not strictly needed if we process sequentially or have row lock, but safe enough here)
     // We update first to avoid double triggering if this takes long
-    await this.prisma.workflowSchedule.update({
-      where: { scheduleId: schedule.scheduleId },
+    // 3.2 Update schedule with next run time using Optimistic Locking
+    // preventing double execution if multiple pods race here
+    const updateResult = await this.prisma.workflowSchedule.updateMany({
+      where: {
+        scheduleId: schedule.scheduleId,
+        nextRunAt: freshSchedule.nextRunAt, // Optimistic lock version check
+      },
       data: {
         lastRunAt: new Date(),
         nextRunAt,
       },
     });
+
+    if (updateResult.count === 0) {
+      this.logger.debug(
+        `Schedule ${schedule.scheduleId} was updated by another process during execution preparation. Skipping to prevent double trigger.`,
+      );
+      return;
+    }
 
     // 3.3 Find or create the WorkflowScheduleRecord for this execution
     // First, check if there's a 'scheduled' record that should be converted
@@ -326,23 +434,55 @@ export class ScheduleCronService implements OnModuleInit {
 
     this.logger.log(`Triggered schedule ${schedule.scheduleId} with priority ${priority}`);
 
-    // Track analytics event for schedule trigger
-    this.trackScheduleEvent(ScheduleAnalyticsEvents.SCHEDULE_RUN_TRIGGERED, {
-      uid: schedule.uid,
-      scheduleId: schedule.scheduleId,
-      scheduleRecordId: currentRecordId,
-      type: getScheduleType(schedule.scheduleConfig),
-      priority,
+    // Get user information once for telemetry (avoid duplicate query)
+    const user = await this.prisma.user.findUnique({
+      where: { uid: schedule.uid },
+      select: { uid: true, email: true },
     });
+
+    // Track analytics event for schedule trigger
+    await this.trackScheduleEvent(
+      ScheduleAnalyticsEvents.SCHEDULE_RUN_TRIGGERED,
+      schedule.uid,
+      {
+        type: getScheduleType(schedule.scheduleConfig),
+      },
+      user,
+    );
   }
 
   /**
-   * Track analytics event (placeholder - integrate with actual analytics service)
+   * Track analytics event using telemetry service
    * @param eventName - Event name from ScheduleAnalyticsEvents
-   * @param properties - Event properties
+   * @param uid - User ID
+   * @param metadata - Event metadata
+   * @param user - Optional user object to avoid duplicate query
    */
-  private trackScheduleEvent(eventName: string, properties: Record<string, any>): void {
-    this.logger.debug(`Analytics event: ${eventName}`, properties);
-    // TODO: Integrate with actual analytics service (e.g., Mixpanel, Amplitude)
+  private async trackScheduleEvent(
+    eventName: string,
+    uid: string,
+    metadata?: Record<string, any>,
+    user?: { uid: string; email?: string | null },
+  ): Promise<void> {
+    try {
+      // Use provided user or query if not provided
+      let userForEvent = user;
+      if (!userForEvent) {
+        userForEvent = await this.prisma.user.findUnique({
+          where: { uid },
+          select: { uid: true, email: true },
+        });
+      }
+
+      if (userForEvent) {
+        logEvent(userForEvent, eventName, null, metadata);
+        this.logger.debug(`Analytics event: ${eventName}`, { uid, ...metadata });
+      } else {
+        this.logger.warn(`User not found for analytics event ${eventName}, uid: ${uid}`);
+      }
+    } catch (error) {
+      // Don't fail the schedule trigger if analytics fails
+      this.logger.error(`Failed to track analytics event ${eventName}:`, error);
+    }
   }
 }

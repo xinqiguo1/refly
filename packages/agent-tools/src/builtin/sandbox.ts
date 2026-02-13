@@ -95,7 +95,7 @@ plt.savefig('chart.png')
 
   async _call(
     input: z.infer<typeof this.schema>,
-    _: any,
+    runManager: { runId?: string } | undefined,
     config: RunnableConfig,
   ): Promise<ToolCallResult> {
     try {
@@ -118,6 +118,8 @@ plt.savefig('chart.png')
           parentResultId: config.configurable?.resultId,
           canvasId: config.configurable?.canvasId,
           version: config.configurable?.version,
+          ptcEnabled: config.configurable?.ptcEnabled,
+          toolCallId: runManager?.runId,
         },
       };
 

@@ -19,12 +19,13 @@ import { createBasePostHandler } from './handler-post';
 import { createBasePreHandler } from './handler-pre';
 import { ResourceHandler } from '../../utils';
 import type { BillingService } from '../../billing/billing.service';
+import { MissingCanvasContextError } from '../../errors/resource-errors';
 
 /**
  * Base handler interface
  * Handles the complete lifecycle of a tool execution request
  */
-export interface IHandler {
+interface IHandler {
   /**
    * Execute the handler with the given request
    * @param request - Handler request containing method, params, and context
@@ -54,30 +55,10 @@ export interface IHandler {
 }
 
 /**
- * Handler factory interface
- * Creates handler instances from configuration
- */
-export interface IHandlerFactory {
-  /**
-   * Create a handler instance from configuration
-   * @param config - Handler configuration
-   * @returns Handler instance
-   */
-  createHandler(config: unknown): IHandler;
-
-  /**
-   * Check if this factory supports the given configuration
-   * @param config - Configuration to check
-   * @returns true if supported
-   */
-  supports(config: unknown): boolean;
-}
-
-/**
  * Base handler implementation
  * Handles the complete request/response lifecycle with pre/post handler support
  */
-export abstract class BaseHandler implements IHandler {
+abstract class BaseHandler implements IHandler {
   protected readonly logger: Logger;
   protected preHandler: PreHandler;
   protected postHandler: PostHandler;
@@ -170,7 +151,11 @@ export abstract class BaseHandler implements IHandler {
             `Post-handler failed: ${(error as Error).message}`,
             (error as Error).stack,
           );
-          // Don't fail the request if post-handler fails, just log it
+          // Re-throw critical errors (e.g., missing canvasId for resource upload)
+          if (error instanceof MissingCanvasContextError) {
+            throw error;
+          }
+          // Don't fail the request if post-handler fails (for non-critical errors), just log it
           // The API call was successful, so we should return the response
         }
       }

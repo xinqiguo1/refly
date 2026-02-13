@@ -1,8 +1,11 @@
 import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import { Modal, Button, Divider } from 'antd';
+import { useSearchParams } from 'react-router-dom';
 import { useListTools } from '@refly-packages/ai-workspace-common/queries';
 import { useCanvasResourcesPanelStoreShallow } from '@refly/stores';
 import { ActionResult, WorkflowPlanRecord } from '@refly/openapi-schema';
+import type { IContextItem } from '@refly/common-types';
+import { MessageFileList } from './message-file-list';
 import { useTranslation } from 'react-i18next';
 import { useCanvasContext } from '@refly-packages/ai-workspace-common/context/canvas';
 import { safeParseJSON } from '@refly/utils';
@@ -11,6 +14,7 @@ import { useReactFlow } from '@xyflow/react';
 import { MessageList } from '@refly-packages/ai-workspace-common/components/result-message';
 import { useFetchActionResult } from '@refly-packages/ai-workspace-common/hooks/canvas/use-fetch-action-result';
 import { useVariablesManagement } from '@refly-packages/ai-workspace-common/hooks/use-variables-management';
+import { useUpdateUserPreferences } from '@refly-packages/ai-workspace-common/hooks/use-update-user-preferences';
 import { useFetchProviderItems } from '@refly-packages/ai-workspace-common/hooks/use-fetch-provider-items';
 import { useCanvasLayout } from '@refly-packages/ai-workspace-common/hooks/canvas/use-canvas-layout';
 import { useUpdateCanvasTitle } from '@refly-packages/ai-workspace-common/hooks/canvas';
@@ -19,6 +23,8 @@ import { logEvent } from '@refly/telemetry-web';
 import getClient from '@refly-packages/ai-workspace-common/requests/proxiedRequest';
 import { useInvokeAction } from '@refly-packages/ai-workspace-common/hooks/canvas/use-invoke-action';
 import { useCanvasStoreShallow } from '@refly/stores';
+import { Spin } from '@refly-packages/ai-workspace-common/components/common/spin';
+import { BsMagic } from 'react-icons/bs';
 
 interface CopilotMessageProps {
   result: ActionResult;
@@ -27,8 +33,34 @@ interface CopilotMessageProps {
 }
 
 export const CopilotMessage = memo(({ result, isFinal, sessionId }: CopilotMessageProps) => {
-  const { resultId, input, steps, status } = result;
+  const [searchParams, setSearchParams] = useSearchParams();
+  const source = useMemo(() => searchParams.get('source'), [searchParams]);
+
+  const { resultId, input, steps, status, context } = result;
   const query = useMemo(() => input?.query ?? '', [input]);
+
+  // Extract file context items from result.context for display
+  const fileContextItems = useMemo((): IContextItem[] => {
+    const contextFiles = context?.files ?? [];
+
+    // Debug log to help diagnose the issue
+    if (contextFiles.length > 0) {
+      console.log('[CopilotMessage] context.files:', contextFiles);
+    }
+
+    if (!contextFiles.length) return [];
+
+    return contextFiles.map((fileItem) => ({
+      type: 'file' as const,
+      entityId: fileItem.fileId,
+      title: fileItem.file?.name ?? fileItem.variableName ?? 'File',
+      metadata: {
+        size: fileItem.file?.size,
+        mimeType: fileItem.file?.type,
+        url: fileItem.file?.url,
+      },
+    }));
+  }, [context?.files]);
 
   const [loading, setLoading] = useState(false);
 
@@ -69,10 +101,12 @@ export const CopilotMessage = memo(({ result, isFinal, sessionId }: CopilotMessa
 
   const { updateTitle } = useUpdateCanvasTitle(canvasId, canvasTitle ?? '');
 
+  const { userProfile, updateUserPreferences } = useUpdateUserPreferences();
+
   const { t } = useTranslation();
   const [modal, contextHolder] = Modal.useModal();
 
-  const { data: tools } = useListTools({ query: { enabled: true } }, undefined, {
+  const { data: tools } = useListTools({ query: { includeUnauthorized: true } }, undefined, {
     enabled: !!canvasId,
   });
 
@@ -96,15 +130,19 @@ export const CopilotMessage = memo(({ result, isFinal, sessionId }: CopilotMessa
     // Check current canvas nodes
     const currentNodes = getNodes() as CanvasNode[];
     const startNodes = currentNodes.filter((node) => node.type === 'start');
-    const skillNodes = currentNodes.filter((node) => node.type === 'skillResponse');
+    const agentNodes = currentNodes.filter((node) => node.type === 'skillResponse');
 
-    // Check if canvas only contains one start node or one start node + one skill node with empty contentPreview
+    const isOnboarding = Boolean(userProfile?.preferences?.needOnboarding);
+
+    // Check if canvas only contains one start node or one start node + one agent node with empty contentPreview
     const shouldSkipConfirmation =
+      isOnboarding ||
       (currentNodes.length === 1 && startNodes.length === 1) ||
       (currentNodes.length === 2 &&
         startNodes.length === 1 &&
-        skillNodes.length === 1 &&
-        !skillNodes[0]?.data?.metadata?.query);
+        agentNodes.length === 1 &&
+        agentNodes[0]?.data?.metadata?.status === 'init' &&
+        (!agentNodes[0]?.data?.metadata?.query || agentNodes[0]?.data?.metadata?.untouched));
 
     if (!shouldSkipConfirmation) {
       // Show confirmation modal
@@ -171,9 +209,21 @@ export const CopilotMessage = memo(({ result, isFinal, sessionId }: CopilotMessa
       }
     }
 
+    if (isOnboarding) {
+      updateUserPreferences({
+        needOnboarding: false,
+      });
+    }
+
+    if (['onboarding', 'frontPage'].includes(source ?? '')) {
+      const newParams = new URLSearchParams(searchParams);
+      newParams.delete('source');
+      setSearchParams(newParams);
+    }
+
     setTimeout(() => {
       onLayout('LR');
-    }, 200);
+    }, 1000);
   }, [
     canvasId,
     workflowPlan,
@@ -191,6 +241,11 @@ export const CopilotMessage = memo(({ result, isFinal, sessionId }: CopilotMessa
     canvasTitle,
     query,
     updateTitle,
+    source,
+    searchParams,
+    setSearchParams,
+    userProfile,
+    updateUserPreferences,
   ]);
 
   const handleRetry = useCallback(() => {
@@ -219,17 +274,38 @@ export const CopilotMessage = memo(({ result, isFinal, sessionId }: CopilotMessa
 
   return (
     <div className="flex flex-col gap-2">
-      {/* User query - right aligned blue bubble */}
-      <div className="flex justify-end pl-5">
-        <div className="rounded-xl bg-[#F2FDFF] dark:bg-[#327576] text-refly-text-0 px-4 py-3 text-[15px] break-all">
-          {input?.query}
-        </div>
+      {/* User message - right aligned */}
+      <div className="flex flex-col items-end gap-2 pl-5">
+        {/* Files attached to this message */}
+        {fileContextItems.length > 0 && (
+          <MessageFileList
+            contextItems={fileContextItems}
+            canvasId={canvasId}
+            className="max-w-full"
+          />
+        )}
+        {/* Text query bubble */}
+        {input?.query && (
+          <div className="rounded-xl bg-refly-node-fill-1 text-refly-text-0 px-4 py-3 text-[15px] break-all">
+            {input.query}
+          </div>
+        )}
       </div>
       {/* AI response - left aligned */}
       <MessageList result={result} stepStatus="finish" handleRetry={handleRetry} />
       {workflowPlan && (
-        <div className="mt-1">
-          <Button type="primary" onClick={handleApprove} loading={loading}>
+        <div className="w-full mt-1 flex justify-end">
+          <Button
+            type="primary"
+            className="!bg-refly-text-0 hover:!bg-refly-text-0 hover:opacity-80 text-refly-bg-canvas hover:!text-refly-bg-canvas font-bold"
+            onClick={handleApprove}
+            icon={<BsMagic size={16} className="flex-shrink-0 text-refly-bg-canvas" />}
+            loading={
+              loading
+                ? { icon: <Spin size="small" className="!text-refly-bg-canvas" /> }
+                : undefined
+            }
+          >
             {t('copilot.sessionDetail.approve')}
           </Button>
         </div>

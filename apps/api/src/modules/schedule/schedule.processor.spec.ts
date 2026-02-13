@@ -47,7 +47,6 @@ describe('ScheduleProcessor Logic Tests', () => {
       execution: {
         success: jest.fn(),
         fail: jest.fn(),
-        skipped: jest.fn(),
       },
       queue: {
         delayed: jest.fn(),
@@ -137,15 +136,7 @@ describe('ScheduleProcessor Logic Tests', () => {
   });
 
   describe('Status Transition Logic', () => {
-    const validStatuses = [
-      'scheduled',
-      'pending',
-      'processing',
-      'running',
-      'success',
-      'failed',
-      'skipped',
-    ];
+    const validStatuses = ['scheduled', 'pending', 'processing', 'running', 'success', 'failed'];
 
     it('should have valid status values', () => {
       expect(validStatuses).toContain('pending');
@@ -244,9 +235,9 @@ describe('ScheduleProcessor Logic Tests', () => {
       expect(metrics.execution.fail).toHaveBeenCalledWith('cron', 'Error');
     });
 
-    it('should have execution skipped method', () => {
-      metrics.execution.skipped('schedule_deleted');
-      expect(metrics.execution.skipped).toHaveBeenCalledWith('schedule_deleted');
+    it('should have execution fail method for deleted/disabled schedules', () => {
+      metrics.execution.fail('cron', 'schedule_deleted');
+      expect(metrics.execution.fail).toHaveBeenCalledWith('cron', 'schedule_deleted');
     });
 
     it('should have queue delayed method', () => {
@@ -267,15 +258,16 @@ describe('ScheduleFailureReason Enum', () => {
       expect(ScheduleFailureReason.SCHEDULE_DISABLED).toBe('schedule_disabled');
       expect(ScheduleFailureReason.INVALID_CRON_EXPRESSION).toBe('invalid_cron_expression');
       expect(ScheduleFailureReason.CANVAS_DATA_ERROR).toBe('canvas_data_error');
+      expect(ScheduleFailureReason.CANVAS_DELETED).toBe('canvas_deleted');
       expect(ScheduleFailureReason.SNAPSHOT_ERROR).toBe('snapshot_error');
       expect(ScheduleFailureReason.WORKFLOW_EXECUTION_FAILED).toBe('workflow_execution_failed');
       expect(ScheduleFailureReason.WORKFLOW_EXECUTION_TIMEOUT).toBe('workflow_execution_timeout');
       expect(ScheduleFailureReason.UNKNOWN_ERROR).toBe('unknown_error');
     });
 
-    it('should have exactly 10 failure reason values', () => {
+    it('should have exactly 11 failure reason values', () => {
       const values = Object.values(ScheduleFailureReason);
-      expect(values.length).toBe(10);
+      expect(values.length).toBe(11);
     });
   });
 

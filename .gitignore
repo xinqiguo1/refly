@@ -53,6 +53,12 @@ docs/.vitepress/cache/*
 # code opt
 *.opt
 
-.claude/settings.local.json
+.claude/*
+.zed/*
 
 .codex/*
+.ai/*
+
+apps/api/load-tests/results/*.json
+apps/api/load-tests/results/*.txt
+.playwright-mcp/*

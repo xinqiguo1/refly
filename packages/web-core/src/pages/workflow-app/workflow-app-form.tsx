@@ -6,8 +6,8 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { UploadFile } from 'antd/es/upload/interface';
 
 import cn from 'classnames';
-import EmptyImage from '@refly-packages/ai-workspace-common/assets/noResource.svg';
-import defaultAvatar from '@refly-packages/ai-workspace-common/assets/refly_default_avatar.png';
+import EmptyImage from '@refly-packages/ai-workspace-common/assets/noResource.webp';
+import defaultAvatar from '@refly-packages/ai-workspace-common/assets/refly_default_avatar_v2.webp';
 import { useUserStoreShallow } from '@refly/stores';
 import { useAuthStoreShallow } from '@refly/stores';
 import { useSubscriptionStoreShallow } from '@refly/stores';
@@ -611,12 +611,19 @@ export const WorkflowAPPForm = ({
       let newVariables: WorkflowVariable[] = [];
 
       if (effectiveTemplateContent) {
-        // Validate templateVariables values
+        // Validate templateVariables values - only check required fields
         const hasInvalidValues = templateVariables.some((variable) => {
+          // Skip validation if variable is not required
+          if (!variable.required) {
+            return false;
+          }
+
+          // Check if value is missing or empty
           if (!variable.value || variable.value.length === 0) {
             return true;
           }
 
+          // Check if all values are invalid (empty)
           return variable.value.every((val) => {
             if (variable.variableType === 'string') {
               return !val.text || val.text.trim() === '';

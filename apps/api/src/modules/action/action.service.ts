@@ -17,11 +17,13 @@ import {
   safeParseJSON,
 } from '@refly/utils';
 import pLimit from 'p-limit';
+import { ABORT_MESSAGES } from '../skill/skill.constants';
 import {
   ActionResult,
   ActionMessage as ActionMessageModel,
   ToolCallResult as ToolCallResultModel,
 } from '@prisma/client';
+import { purgeContextForActionResult, purgeHistoryForActionResult } from '@refly/canvas-common';
 import { ActionDetail, actionMessagePO2DTO, sanitizeToolOutput } from '../action/action.dto';
 import { PrismaService } from '../common/prisma.service';
 import { providerItem2ModelInfo } from '../provider/provider.dto';
@@ -322,8 +324,14 @@ export class ActionService {
               'errors',
               'errorType',
             ]),
-            context: batchReplaceRegex(context ?? '{}', combinedReplaceMap),
-            history: batchReplaceRegex(history ?? '[]', combinedReplaceMap),
+            context: JSON.stringify(
+              purgeContextForActionResult(
+                safeParseJSON(batchReplaceRegex(context ?? '{}', combinedReplaceMap)),
+              ),
+            ),
+            history: JSON.stringify(
+              purgeHistoryForActionResult(batchReplaceRegex(history ?? '[]', combinedReplaceMap)),
+            ),
             resultId: newResultId,
             uid: user.uid,
             targetId,
@@ -603,10 +611,9 @@ export class ActionService {
     // Get the abort controller for this action
     const entry = this.activeAbortControllers.get(resultId);
 
-    // Determine the error message based on the reason
-    const defaultReason = 'User aborted the action';
-    const abortReason = reason || 'User requested abort';
-    const errorMessage = reason || defaultReason;
+    // Use unified abort message constant
+    const abortReason = reason || ABORT_MESSAGES.USER_ABORT;
+    const errorMessage = reason || ABORT_MESSAGES.USER_ABORT;
 
     if (entry) {
       // Abort the action

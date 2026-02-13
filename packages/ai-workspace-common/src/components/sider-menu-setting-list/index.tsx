@@ -1,6 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import { Button, Dropdown, Divider, Avatar } from 'antd';
 import { useUserStore } from '@refly/stores';
+import { subscriptionEnabled } from '@refly/ui-kit';
 import { useSiderStoreShallow } from '@refly/stores';
 import { useLogout } from '@refly-packages/ai-workspace-common/hooks/use-logout';
 import { useThemeStoreShallow } from '@refly/stores';
@@ -24,7 +25,7 @@ import React from 'react';
 import { TFunction } from 'i18next';
 import { useSubscriptionStoreShallow } from '@refly/stores';
 import { UserSettings } from '@refly/openapi-schema';
-import defaultAvatar from '@refly-packages/ai-workspace-common/assets/refly_default_avatar.png';
+import defaultAvatar from '@refly-packages/ai-workspace-common/assets/refly_default_avatar_v2.webp';
 
 // Reusable dropdown item component
 const DropdownItem = React.memo(
@@ -62,7 +63,7 @@ const SubscriptionCard = React.memo(
     }));
 
     return (
-      <div className="subscription-card p-3 shadow-refly-m rounded-lg border-solid border-[1px] border-refly-Card-Border bg-refly-bg-float-z3">
+      <div className="subscription-card p-3 shadow-refly-m rounded-lg border-solid border-[1px] border-refly-Card-Border">
         <div className="flex items-center justify-between gap-2 text-refly-text-0 text-xs leading-4 font-semibold">
           {planType === 'free'
             ? t('subscription.subscriptionManagement.planNames.freePlan')
@@ -147,13 +148,15 @@ const UserInfo = React.memo(
             </div>
           </div>
         </div>
-        <SubscriptionCard
-          planType={planType}
-          creditBalance={creditBalance}
-          t={t}
-          setOpen={setOpen}
-          handleSubscriptionClick={handleSubscriptionClick}
-        />
+        {subscriptionEnabled && (
+          <SubscriptionCard
+            planType={planType}
+            creditBalance={creditBalance}
+            t={t}
+            setOpen={setOpen}
+            handleSubscriptionClick={handleSubscriptionClick}
+          />
+        )}
       </div>
     );
   },
@@ -197,18 +200,17 @@ export const SiderMenuSettingList = (props: SiderMenuSettingListProps) => {
     setSettingsModalActiveTab: state.setSettingsModalActiveTab,
   }));
   const { handleLogout, contextHolder } = useLogout();
-  const { themeMode, setThemeMode, setLoggedIn, initTheme } = useThemeStoreShallow((state) => ({
+  const { themeMode, setThemeMode, setLoggedIn } = useThemeStoreShallow((state) => ({
     themeMode: state.themeMode,
     setThemeMode: state.setThemeMode,
     setLoggedIn: state.setLoggedIn,
-    initTheme: state.initTheme,
   }));
 
   // Initialize theme based on login status
   useEffect(() => {
+    // Note: setLoggedIn already calls initTheme internally, so we don't need to call it again
     setLoggedIn(isLoggedIn);
-    initTheme();
-  }, [isLoggedIn, setLoggedIn, initTheme]);
+  }, [isLoggedIn, setLoggedIn]);
 
   // Handle menu item clicks
   const handleSettingsClick = useCallback(() => {

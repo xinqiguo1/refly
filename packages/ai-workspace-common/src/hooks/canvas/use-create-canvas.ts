@@ -4,12 +4,17 @@ import { useNavigate } from 'react-router-dom';
 import getClient from '@refly-packages/ai-workspace-common/requests/proxiedRequest';
 import { logEvent } from '@refly/telemetry-web';
 import { useHandleSiderData } from '@refly-packages/ai-workspace-common/hooks/use-handle-sider-data';
-import { useCanvasResourcesPanelStoreShallow } from '@refly/stores';
+import {
+  useCanvasResourcesPanelStoreShallow,
+  useCopilotStoreShallow,
+  useSiderStoreShallow,
+} from '@refly/stores';
 
 interface CreateCanvasOptions {
   isPilotActivated?: boolean;
   isMediaGeneration?: boolean;
   isAsk?: boolean;
+  initialPrompt?: string;
 }
 
 export const useCreateCanvas = ({
@@ -25,6 +30,12 @@ export const useCreateCanvas = ({
       setWideScreenVisible: state.setWideScreenVisible,
     }),
   );
+  const { setPendingPrompt } = useCopilotStoreShallow((state) => ({
+    setPendingPrompt: state.setPendingPrompt,
+  }));
+  const { setIsManualCollapse } = useSiderStoreShallow((state) => ({
+    setIsManualCollapse: state.setIsManualCollapse,
+  }));
 
   const createCanvas = async (canvasTitle: string) => {
     setIsCreating(true);
@@ -90,17 +101,22 @@ export const useCreateCanvas = ({
         });
       }
 
+      if (options?.initialPrompt) {
+        setPendingPrompt(canvasId, options.initialPrompt);
+      }
+
       if (!options?.isPilotActivated && !options?.isMediaGeneration && !options?.isAsk) {
         logEvent('canvas::create_canvas_from_home', Date.now(), {});
       }
 
+      setIsManualCollapse(false);
       // Add canvasId to query params if in project view
       if (projectId) {
         queryParams.append('canvasId', canvasId);
         navigate(`/project/${projectId}?${queryParams.toString()}`);
       } else {
         navigate(
-          `/canvas/${canvasId}${queryParams.toString() ? `?${queryParams.toString()}` : ''}`,
+          `/workflow/${canvasId}${queryParams.toString() ? `?${queryParams.toString()}` : ''}`,
         );
       }
 
@@ -110,5 +126,5 @@ export const useCreateCanvas = ({
     { leading: true },
   );
 
-  return { debouncedCreateCanvas, isCreating };
+  return { debouncedCreateCanvas, createCanvas, isCreating };
 };

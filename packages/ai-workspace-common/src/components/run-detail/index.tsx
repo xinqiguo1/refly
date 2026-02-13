@@ -8,7 +8,7 @@ import { Spin } from '@refly-packages/ai-workspace-common/components/common/spin
 import { useDuplicateCanvas } from '@refly-packages/ai-workspace-common/hooks/use-duplicate-canvas';
 import getClient from '@refly-packages/ai-workspace-common/requests/proxiedRequest';
 import { logEvent } from '@refly/telemetry-web';
-import EmptyImage from '@refly-packages/ai-workspace-common/assets/noResource.svg';
+import EmptyImage from '@refly-packages/ai-workspace-common/assets/noResource.webp';
 import './index.scss';
 
 export type RunDetailType = 'workflow' | 'template' | 'schedule';
@@ -128,9 +128,6 @@ const RunDetail = memo(({ recordId, type = 'schedule' }: RunDetailProps) => {
       canvasId: record.canvasId,
       title: record.workflowTitle || t('common.untitled'),
       isCopy: true,
-      onSuccess: () => {
-        message.success(t('runDetail.duplicateSuccess'));
-      },
     });
   }, [record, duplicateCanvas, t, type, recordId]);
 
@@ -141,9 +138,11 @@ const RunDetail = memo(({ recordId, type = 'schedule' }: RunDetailProps) => {
         status: record.status,
         triggeredAt: record.triggeredAt,
         completedAt: record.completedAt,
+        scheduledAt: record.scheduledAt,
         creditUsed: record.creditUsed,
         failureReason: record.failureReason,
         canvasId: record.sourceCanvasId || record.canvasId,
+        sourceCanvasId: record.sourceCanvasId,
         workflowTitle: record.workflowTitle,
       }
     : undefined;

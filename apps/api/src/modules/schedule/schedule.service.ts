@@ -16,8 +16,10 @@ import {
   getScheduleConfig,
   type ScheduleConfig,
   ScheduleFailureReason,
+  ScheduleAnalyticsEvents,
 } from './schedule.constants';
 import { SchedulePriorityService } from './schedule-priority.service';
+import { logEvent } from '@refly/telemetry-node';
 
 @Injectable()
 export class ScheduleService {
@@ -107,6 +109,35 @@ export class ScheduleService {
     }
   }
 
+  /**
+   * Track analytics event using telemetry service
+   * @param eventName - Event name from ScheduleAnalyticsEvents
+   * @param uid - User ID
+   * @param metadata - Event metadata
+   */
+  private async trackScheduleEvent(
+    eventName: string,
+    uid: string,
+    metadata?: Record<string, any>,
+  ): Promise<void> {
+    try {
+      const user = await this.prisma.user.findUnique({
+        where: { uid },
+        select: { uid: true, email: true },
+      });
+
+      if (user) {
+        logEvent(user, eventName, undefined, metadata);
+        this.logger.debug(`Analytics event: ${eventName}`, { uid, ...metadata });
+      } else {
+        this.logger.warn(`User not found for analytics event ${eventName}, uid: ${uid}`);
+      }
+    } catch (error) {
+      // Don't fail the operation if analytics fails
+      this.logger.error(`Failed to track analytics event ${eventName}:`, error);
+    }
+  }
+
   async createSchedule(uid: string, dto: CreateScheduleDto) {
     // 1. Validate Cron Expression
     this.validateCronExpression(dto.cronExpression, dto.timezone);
@@ -114,22 +145,105 @@ export class ScheduleService {
     // 2. Validate Canvas exists and belongs to user
     await this.validateCanvas(uid, dto.canvasId);
 
-    // 3. Check if schedule already exists for this canvas
+    // 3. Check if schedule already exists for this canvas (including soft-deleted records)
     const existingSchedule = await this.prisma.workflowSchedule.findFirst({
-      where: { canvasId: dto.canvasId, uid, deletedAt: null },
+      where: { canvasId: dto.canvasId, uid }, // Don't filter deletedAt to handle soft-deleted records
     });
 
-    // 4. Determine if schedule should be enabled
-    const isEnabled = dto.isEnabled ?? existingSchedule?.isEnabled ?? false;
+    // 4. If soft-deleted record exists, restore it
+    if (existingSchedule?.deletedAt) {
+      this.logger.log(
+        `Restoring soft-deleted schedule ${existingSchedule.scheduleId} for canvas ${dto.canvasId}`,
+      );
 
-    // 5. Check Plan Quota (only if enabling the schedule from disabled state)
-    if (existingSchedule?.isEnabled === false && isEnabled === true) {
-      await this.checkScheduleQuota(uid, existingSchedule.scheduleId);
-    } else if (!existingSchedule && isEnabled) {
-      await this.checkScheduleQuota(uid);
+      // Determine if schedule should be enabled
+      const isEnabled = dto.isEnabled ?? false;
+
+      // Check quota if enabling
+      if (isEnabled) {
+        await this.checkScheduleQuota(uid, existingSchedule.scheduleId);
+        // Track schedule enable event
+        await this.trackScheduleEvent(ScheduleAnalyticsEvents.SCHEDULE_ENABLE, uid, {
+          scheduleId: existingSchedule.scheduleId,
+          canvasId: dto.canvasId,
+          cronExpression: dto.cronExpression,
+          timezone: dto.timezone || existingSchedule.timezone || 'Asia/Shanghai',
+        });
+      }
+
+      // Calculate next run time
+      let nextRunAt: Date | null = null;
+      if (isEnabled) {
+        try {
+          const interval = CronExpressionParser.parse(dto.cronExpression, {
+            tz: dto.timezone || 'Asia/Shanghai',
+          });
+          nextRunAt = interval.next().toDate();
+        } catch {
+          throw new BadRequestException(ScheduleFailureReason.INVALID_CRON_EXPRESSION);
+        }
+      }
+
+      // Get canvas title for default name if name not provided
+      let scheduleName = dto.name;
+      if (!scheduleName) {
+        const canvas = await this.prisma.canvas.findUnique({
+          where: { canvasId: dto.canvasId },
+          select: { title: true },
+        });
+        scheduleName = canvas?.title || 'Scheduled Task';
+      }
+
+      // Restore and update the soft-deleted record
+      const restored = await this.prisma.workflowSchedule.update({
+        where: { scheduleId: existingSchedule.scheduleId },
+        data: {
+          name: scheduleName,
+          cronExpression: dto.cronExpression,
+          scheduleConfig: dto.scheduleConfig,
+          timezone: dto.timezone || existingSchedule.timezone,
+          isEnabled,
+          nextRunAt,
+          deletedAt: null, // Clear soft-delete flag
+          updatedAt: new Date(),
+        },
+      });
+
+      // Create scheduled record if enabled
+      if (isEnabled && nextRunAt) {
+        await this.createOrUpdateScheduledRecord(
+          uid,
+          existingSchedule.scheduleId,
+          dto.canvasId,
+          nextRunAt,
+        );
+      }
+
+      return this.excludePk(restored);
     }
 
-    // 6. Calculate next run time
+    // 5. Determine if schedule should be enabled
+    const isEnabled = dto.isEnabled ?? existingSchedule?.isEnabled ?? false;
+    const wasEnabled = existingSchedule?.isEnabled ?? false;
+
+    // 6. Check Plan Quota (always check when enabling, regardless of previous state)
+    if (isEnabled === true) {
+      // Only pass scheduleId if existingSchedule exists
+      const scheduleIdToExclude = existingSchedule?.scheduleId;
+      await this.checkScheduleQuota(uid, scheduleIdToExclude);
+      // Track schedule enable event only when transitioning from disabled to enabled
+      if (!wasEnabled) {
+        const timezone = dto.timezone || existingSchedule?.timezone || 'Asia/Shanghai';
+        await this.trackScheduleEvent(ScheduleAnalyticsEvents.SCHEDULE_ENABLE, uid, {
+          scheduleId: existingSchedule?.scheduleId,
+          canvasId: dto.canvasId,
+          cronExpression: dto.cronExpression,
+          timezone,
+        });
+      }
+    }
+
+    // 7. Calculate next run time
     const cron = dto.cronExpression;
     const timezone = dto.timezone || existingSchedule?.timezone || 'Asia/Shanghai';
     let nextRunAt: Date | null = null;
@@ -158,7 +272,7 @@ export class ScheduleService {
       nextRunAt = existingSchedule?.nextRunAt ?? null;
     }
 
-    // 7. Get canvas title for default name if name not provided
+    // 8. Get canvas title for default name if name not provided
     let scheduleName = dto.name;
     if (!scheduleName) {
       if (existingSchedule?.name) {
@@ -172,7 +286,7 @@ export class ScheduleService {
       }
     }
 
-    // 8. Create or update Schedule
+    // 9. Create or update Schedule
     const scheduleId = existingSchedule?.scheduleId ?? genScheduleId();
 
     if (existingSchedule) {
@@ -342,7 +456,8 @@ export class ScheduleService {
     uid: string,
     page = 1,
     pageSize = 10,
-    status?: 'scheduled' | 'pending' | 'processing' | 'running' | 'success' | 'failed' | 'skipped',
+    executionStatus?: 'scheduled' | 'pending' | 'processing' | 'running' | 'success' | 'failed',
+    triggerType?: 'schedule' | 'webhook' | 'api',
     keyword?: string,
     tools?: string[],
     canvasId?: string,
@@ -355,11 +470,22 @@ export class ScheduleService {
     }
 
     // Filter by status - only show completed records (success/failed) by default
-    if (status) {
-      where.status = status;
+    if (executionStatus) {
+      where.status = executionStatus;
     } else {
       // Default: only show success or failed records
       where.status = { in: ['success', 'failed'] };
+    }
+
+    if (triggerType === 'webhook') {
+      where.scheduleId = { startsWith: 'webhook:' };
+    } else if (triggerType === 'api') {
+      where.scheduleId = { startsWith: 'api:' };
+    } else if (triggerType === 'schedule') {
+      where.NOT = [
+        { scheduleId: { startsWith: 'webhook:' } },
+        { scheduleId: { startsWith: 'api:' } },
+      ];
     }
 
     // Filter by keyword (search in workflowTitle)
@@ -383,7 +509,7 @@ export class ScheduleService {
       this.prisma.workflowScheduleRecord.count({ where }),
       this.prisma.workflowScheduleRecord.findMany({
         where,
-        orderBy: { scheduledAt: 'desc' },
+        orderBy: [{ scheduledAt: 'desc' }, { pk: 'desc' }],
         skip: (page - 1) * pageSize,
         take: pageSize,
       }),
@@ -676,7 +802,8 @@ export class ScheduleService {
           scheduleRecordId,
           scheduleId,
           uid,
-          canvasId,
+          sourceCanvasId: canvasId, // Source canvas (template)
+          canvasId: '', // Will be updated after execution with actual execution canvas
           workflowTitle: canvas?.title || 'Untitled',
           status: 'scheduled',
           scheduledAt,

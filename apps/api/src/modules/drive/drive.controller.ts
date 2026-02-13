@@ -10,8 +10,13 @@ import {
   Param,
   Res,
   Req,
+  UseInterceptors,
+  UploadedFile,
+  ParseFilePipe,
+  MaxFileSizeValidator,
 } from '@nestjs/common';
-import { ApiTags } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiConsumes } from '@nestjs/swagger';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { JwtAuthGuard } from '../auth/guard/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from '../auth/guard/optional-jwt-auth.guard';
 import { DriveService } from './drive.service';
@@ -28,6 +33,9 @@ import {
   BatchCreateDriveFilesResponse,
   DriveFileSource,
   DriveFileScope,
+  StartExportJobRequest,
+  StartExportJobResponse,
+  GetExportJobStatusResponse,
 } from '@refly/openapi-schema';
 import { buildSuccessResponse } from '../../utils/response';
 import { Response, Request } from 'express';
@@ -81,6 +89,29 @@ export class DriveController {
     return buildSuccessResponse(driveFiles);
   }
 
+  @Post('file/upload')
+  @UseGuards(JwtAuthGuard)
+  @UseInterceptors(
+    FileInterceptor('file', {
+      limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
+    }),
+  )
+  @ApiOperation({ summary: 'Upload file to canvas' })
+  @ApiConsumes('multipart/form-data')
+  async uploadFile(
+    @UploadedFile(
+      new ParseFilePipe({
+        validators: [new MaxFileSizeValidator({ maxSize: 50 * 1024 * 1024 })],
+      }),
+    )
+    file: Express.Multer.File,
+    @Body('canvasId') canvasId: string,
+    @LoginedUser() user: User,
+  ): Promise<UpsertDriveFileResponse> {
+    const result = await this.driveService.uploadAndCreateFile(user, file, canvasId);
+    return buildSuccessResponse(result);
+  }
+
   @Post('file/update')
   @UseGuards(JwtAuthGuard)
   async updateDriveFile(
@@ -110,12 +141,59 @@ export class DriveController {
     @Res() res: Response,
     @Req() req: Request,
   ): Promise<void> {
+    await this.serveDriveFileInternal({ user, fileId, download, res, req });
+  }
+
+  @Get('file/content/:fileId/:filename')
+  @UseGuards(OptionalJwtAuthGuard)
+  async serveDriveFileWithName(
+    @LoginedUser() user: User | null,
+    @Param('fileId') fileId: string,
+    @Param('filename') filename: string,
+    @Query('download') download: string,
+    @Res() res: Response,
+    @Req() req: Request,
+  ): Promise<void> {
+    await this.serveDriveFileInternal({ user, fileId, download, res, req, filename });
+  }
+
+  @Get('file/public/:fileId')
+  async servePublicDriveFile(
+    @Param('fileId') fileId: string,
+    @Query('download') download: string,
+    @Res() res: Response,
+    @Req() req: Request,
+  ): Promise<void> {
+    await this.servePublicDriveFileInternal({ fileId, download, res, req });
+  }
+
+  @Get('file/public/:fileId/:filename')
+  async servePublicDriveFileWithName(
+    @Param('fileId') fileId: string,
+    @Param('filename') filename: string,
+    @Query('download') download: string,
+    @Res() res: Response,
+    @Req() req: Request,
+  ): Promise<void> {
+    await this.servePublicDriveFileInternal({ fileId, download, res, req, filename });
+  }
+
+  private async serveDriveFileInternal(params: {
+    user: User | null;
+    fileId: string;
+    download: string;
+    res: Response;
+    req: Request;
+    filename?: string;
+  }): Promise<void> {
+    const { user, fileId, download, res, req, filename: filenameHint } = params;
     const origin = req.headers.origin;
 
     // First, get only metadata (no file content loaded yet)
     // Uses unified access: checks externalOss (public) first, then internalOss (private) if user is authenticated
     const { contentType, filename, lastModified, isPublic } =
       await this.driveService.getUnifiedFileMetadata(fileId, user);
+    const resolvedFilename = filename || filenameHint || 'file';
 
     // Check HTTP cache and get cache headers
     const cacheResult = checkHttpCache(req, {
@@ -141,7 +219,12 @@ export class DriveController {
     // Process content for download: replace private URLs with public URLs in markdown/html
     // Only process if user is authenticated (private files)
     if (download && user && !isPublic) {
-      data = await this.driveService.processContentForDownload(user, data, filename, contentType);
+      data = await this.driveService.processContentForDownload(
+        user,
+        data,
+        resolvedFilename,
+        contentType,
+      );
     }
 
     // Return file with cache headers
@@ -151,7 +234,7 @@ export class DriveController {
       ...corsHeaders,
       ...(download
         ? {
-            'Content-Disposition': buildContentDisposition(filename),
+            'Content-Disposition': buildContentDisposition(resolvedFilename),
           }
         : {}),
     });
@@ -159,18 +242,20 @@ export class DriveController {
     res.end(data);
   }
 
-  @Get('file/public/:fileId')
-  async servePublicDriveFile(
-    @Param('fileId') fileId: string,
-    @Query('download') download: string,
-    @Res() res: Response,
-    @Req() req: Request,
-  ): Promise<void> {
+  private async servePublicDriveFileInternal(params: {
+    fileId: string;
+    download: string;
+    res: Response;
+    req: Request;
+    filename?: string;
+  }): Promise<void> {
+    const { fileId, download, res, req, filename: filenameHint } = params;
     const origin = req.headers.origin;
 
     // First, get only metadata (no file content loaded yet)
     const { contentType, filename, lastModified } =
       await this.driveService.getPublicFileMetadata(fileId);
+    const resolvedFilename = filename || filenameHint || 'file';
 
     // Check HTTP cache and get cache headers
     const cacheResult = checkHttpCache(req, {
@@ -200,7 +285,7 @@ export class DriveController {
       ...corsHeaders,
       ...(download
         ? {
-            'Content-Disposition': buildContentDisposition(filename),
+            'Content-Disposition': buildContentDisposition(resolvedFilename),
           }
         : {}),
     });
@@ -230,6 +315,53 @@ export class DriveController {
 
     res.set({
       'Content-Type': contentType,
+      'Access-Control-Allow-Origin': origin || '*',
+      'Access-Control-Allow-Credentials': 'true',
+      'Cross-Origin-Resource-Policy': 'cross-origin',
+    });
+
+    res.end(data);
+  }
+
+  @Post('document/export/async')
+  @UseGuards(JwtAuthGuard)
+  async startExportJob(
+    @LoginedUser() user: User,
+    @Body() request: StartExportJobRequest,
+  ): Promise<StartExportJobResponse> {
+    const exportJob = await this.driveService.startExportJob(user, request);
+    return buildSuccessResponse(exportJob);
+  }
+
+  @Get('document/export/job/:jobId')
+  @UseGuards(JwtAuthGuard)
+  async getExportJobStatus(
+    @LoginedUser() user: User,
+    @Param('jobId') jobId: string,
+  ): Promise<GetExportJobStatusResponse> {
+    const exportJob = await this.driveService.getExportJobStatus(user, jobId);
+    return buildSuccessResponse(exportJob);
+  }
+
+  @Get('document/export/job/:jobId/download')
+  @UseGuards(JwtAuthGuard)
+  async downloadExportJobResult(
+    @LoginedUser() user: User,
+    @Param('jobId') jobId: string,
+    @Res() res: Response,
+    @Req() req: Request,
+  ): Promise<void> {
+    const { data, contentType, filename } = await this.driveService.downloadExportJobResult(
+      user,
+      jobId,
+    );
+
+    const origin = req.headers.origin;
+
+    res.set({
+      'Content-Type': contentType,
+      'Content-Length': String(data.length),
+      'Content-Disposition': buildContentDisposition(filename),
       'Access-Control-Allow-Origin': origin || '*',
       'Access-Control-Allow-Credentials': 'true',
       'Cross-Origin-Resource-Policy': 'cross-origin',

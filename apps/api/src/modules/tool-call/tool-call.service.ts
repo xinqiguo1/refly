@@ -7,11 +7,6 @@ import { writeSSEResponse } from '../../utils/response';
 import { PrismaService } from '../common/prisma.service';
 import { ActionStep, ToolCallResult } from '@prisma/client';
 import { sanitizeToolOutput } from '../action/action.dto';
-export type ToolEventPayload = {
-  run_id?: string;
-  metadata?: { toolsetKey?: string; name?: string };
-  data?: { input?: unknown; output?: unknown; error?: unknown };
-};
 
 // Tool call status
 export enum ToolCallStatus {
@@ -189,6 +184,21 @@ export class ToolCallService {
       where: {
         resultId,
         version,
+        deletedAt: null,
+      },
+      orderBy: { pk: 'asc' },
+    });
+  }
+
+  /**
+   * Fetch PTC tool calls by ptcCallId (the execute_code's callId)
+   * Used to retrieve all tool calls made from within a sandbox execution
+   */
+  async fetchPtcToolCalls(ptcCallId: string) {
+    return this.prisma.toolCallResult.findMany({
+      where: {
+        ptcCallId,
+        type: 'ptc',
         deletedAt: null,
       },
       orderBy: { pk: 'asc' },

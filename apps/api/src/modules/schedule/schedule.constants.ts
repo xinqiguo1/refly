@@ -179,6 +179,9 @@ export enum ScheduleFailureReason {
   /** Canvas data error (missing nodes/edges) */
   CANVAS_DATA_ERROR = 'canvas_data_error',
 
+  /** Canvas was deleted - schedule has been released */
+  CANVAS_DELETED = 'canvas_deleted',
+
   /** Snapshot creation or loading failed */
   SNAPSHOT_ERROR = 'snapshot_error',
 
@@ -277,12 +280,12 @@ export const SchedulePeriodType = {
   CUSTOM: 'custom', // For complex schedules or when parsing fails
 } as const;
 
-export type SchedulePeriodTypeValue = (typeof SchedulePeriodType)[keyof typeof SchedulePeriodType];
-
 /**
  * Analytics event names for schedule module
  */
 export const ScheduleAnalyticsEvents = {
   /** Schedule execution triggered at Next Run Time */
   SCHEDULE_RUN_TRIGGERED: 'schedule_run_triggered',
+  /** Schedule enabled */
+  SCHEDULE_ENABLE: 'schedule_enable',
 } as const;
